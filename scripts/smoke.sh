@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end test against a running stack. Usage: scripts/smoke.sh [base_url]
-# Needs: curl, python3, and docker-compose (only for the DB tamper step).
+# Needs: curl, python3, and docker compose (only for the DB tamper step).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BASE="${1:-http://localhost:8000}/api/v1"
@@ -78,7 +78,7 @@ call GET /keys "$AUD"; check "auditor lists keys" 200
 call POST /keys/university/rotate "$AUD"; check "auditor cannot rotate keys" 403
 
 echo "== tamper detection (direct database edit)"
-DBX() { docker-compose exec -T postgres psql -U acvs -d acvs -qAt -c "$1" 2>&1; }
+DBX() { docker compose exec -T postgres psql -U acvs -d acvs -qAt -c "$1" 2>&1; }
 DBX "UPDATE credentials SET student_name='Mallory' WHERE id='$ID'" >/dev/null
 call GET /verify/$ID; expect "edited name -> INVALID" "$(echo "$BODY" | j "d['verdict']")" INVALID
 DBX "UPDATE credentials SET student_name='Ada Lovelace' WHERE id='$ID'" >/dev/null
