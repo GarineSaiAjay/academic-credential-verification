@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# End-to-end test against a running stack. Usage: scripts/smoke.sh [base_url]
+# Needs: curl, python3, and docker-compose (only for the DB tamper step).
+set -uo pipefail
+cd "$(dirname "$0")/.."
+BASE="${1:-http://localhost:8000}/api/v1"
+PASS=$(grep '^SEED_DEMO_PASSWORD=' .env | cut -d= -f2)
+fails=0
+
+j() { python3 -c "import sys,json; d=json.load(sys.stdin); print(eval(sys.argv[1]))" "$1"; }
+nonce() { python3 -c "import uuid; print(uuid.uuid4())"; }
+# call METHOD PATH TOKEN [BODY] -> prints "STATUS BODY"
+call() {
+  local m=$1 p=$2 t=${3:-} b=${4:-}
+  local args=(-s -o /tmp/acvs_body -w '%{http_code}' -X "$m" "$BASE$p" -H 'Content-Type: application/json')
+  [ -n "$t" ] && args+=(-H "Authorization: Bearer $t")
+  [ "$m" = POST ] && [ "${NONCE:-auto}" = auto ] && args+=(-H "X-Nonce: $(nonce)" -H "X-Timestamp: $(date +%s)")
+  [ -n "$b" ] && args+=(-d "$b")
+  CODE=$(curl "${args[@]}"); BODY=$(cat /tmp/acvs_body)
+}
+check() { # name expected_code
+  if [ "$CODE" = "$2" ]; then echo "  ok   $1 ($CODE)"; else echo "  FAIL $1: expected $2 got $CODE: $BODY"; fails=$((fails+1)); fi
+}
+expect() { # name actual expected
+  if [ "$2" = "$3" ]; then echo "  ok   $1 = $3"; else echo "  FAIL $1: expected '$3' got '$2'"; fails=$((fails+1)); fi
+}
+login() { call POST /auth/login "" "{\"email\":\"$1@university.edu\",\"password\":\"$PASS\"}"; echo "$BODY" | j "d.get('token','')"; }
+
+echo "== login"
+FAC=$(login faculty); EXC=$(login examcell); REG=$(login registrar); ADM=$(login admin); AUD=$(login auditor)
+for t in "$FAC" "$EXC" "$REG" "$ADM" "$AUD"; do [ -n "$t" ] || { echo "FAIL: login"; exit 1; }; done
+call POST /auth/login "" '{"email":"faculty@university.edu","password":"wrong"}'; check "bad password rejected" 401
+call GET /credentials ""; check "no token rejected" 401
+call GET /credentials "garbage"; check "bad token rejected" 401
+
+echo "== workflow"
+BODY_C='{"student_id":"STU-1","student_name":"Ada Lovelace","program":"BSc Computer Science","graduation_date":"2025-05-15","gpa":"3.9","honors":"Cum Laude"}'
+call POST /credentials "$EXC" "$BODY_C"; check "exam cell cannot create" 403
+call POST /credentials "$FAC" '{"student_id":"","student_name":"x","program":"x","graduation_date":"2025-05-15"}'; check "validation rejects empty id" 400
+call POST /credentials "$FAC" '{"student_id":"S","student_name":"x","program":"x","graduation_date":"15/05/2025"}'; check "validation rejects bad date" 400
+call POST /credentials "$FAC" "$BODY_C"; check "faculty creates + signs" 201
+ID=$(echo "$BODY" | j "d['id']"); HASH=$(echo "$BODY" | j "d['credential_hash']")
+call POST /credentials/$ID/approve "$FAC"; check "faculty cannot self-approve later stage" 409
+call POST /credentials/$ID/approve "$REG"; check "registrar cannot skip exam cell" 409
+call POST /credentials/$ID/approve "$EXC"; check "exam cell signs" 200
+call POST /credentials/$ID/approve "$EXC"; check "exam cell cannot sign twice" 409
+call POST /credentials/$ID/approve "$REG"; check "registrar signs" 200
+call GET /verify/$ID; expect "verdict while pending" "$(echo "$BODY" | j "d['verdict']")" PENDING
+call POST /credentials/$ID/approve "$ADM"; check "university signs -> issued" 200
+
+echo "== public verification"
+call GET "/verify/$ID?h=${HASH:0:16}"; check "public verify (no auth)" 200
+expect "verdict" "$(echo "$BODY" | j "d['verdict']")" VALID
+expect "signature count" "$(echo "$BODY" | j "len(d['signatures'])")" 4
+expect "qr hash match" "$(echo "$BODY" | j "d['qr_hash_match']")" True
+call GET "/verify/$ID?h=deadbeefdeadbeef"; expect "forged qr hash detected" "$(echo "$BODY" | j "d['qr_hash_match']")" False
+curl -s -o /tmp/acvs_qr.png -w '%{content_type}' "$BASE/credentials/$ID/qr" | grep -q image/png && echo "  ok   qr png served" || { echo "  FAIL qr"; fails=$((fails+1)); }
+
+echo "== ledger"
+call POST /ledger/seal "$FAC"; check "faculty cannot seal" 403
+call POST /ledger/seal "$ADM"; check "admin seals block" 200
+call POST /ledger/seal "$ADM"; check "nothing left to seal" 409
+call GET /verify/$ID; expect "anchored + proof ok" "$(echo "$BODY" | j "d['anchor']['ok']")" True
+call GET /ledger/verify; expect "chain ok" "$(echo "$BODY" | j "d['ok']")" True
+
+echo "== security"
+call POST /credentials/$ID/revoke "$FAC" '{"reason":"nope"}'; check "faculty cannot revoke" 403
+NONCE=fixed; H=(-H "Authorization: Bearer $EXC" -H "Content-Type: application/json")
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/credentials" "${H[@]}" -d "$BODY_C"); expect "missing nonce rejected" "$CODE" 400
+N=$(nonce); T=$(date +%s)
+curl -s -o /dev/null -X POST "$BASE/credentials" -H "Authorization: Bearer $FAC" -H "X-Nonce: $N" -H "X-Timestamp: $T" -H 'Content-Type: application/json' -d "$BODY_C"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/credentials" -H "Authorization: Bearer $FAC" -H "X-Nonce: $N" -H "X-Timestamp: $T" -H 'Content-Type: application/json' -d "$BODY_C"); expect "replayed request rejected" "$CODE" 409
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/credentials" -H "Authorization: Bearer $FAC" -H "X-Nonce: $(nonce)" -H "X-Timestamp: $(( $(date +%s) - 600 ))" -H 'Content-Type: application/json' -d "$BODY_C"); expect "stale timestamp rejected" "$CODE" 400
+NONCE=auto
+call GET /audit "$FAC"; check "faculty cannot read audit" 403
+call GET /audit "$AUD"; check "auditor reads audit" 200
+call GET /keys "$AUD"; check "auditor lists keys" 200
+call POST /keys/university/rotate "$AUD"; check "auditor cannot rotate keys" 403
+
+echo "== tamper detection (direct database edit)"
+DBX() { docker-compose exec -T postgres psql -U acvs -d acvs -qAt -c "$1" 2>&1; }
+DBX "UPDATE credentials SET student_name='Mallory' WHERE id='$ID'" >/dev/null
+call GET /verify/$ID; expect "edited name -> INVALID" "$(echo "$BODY" | j "d['verdict']")" INVALID
+DBX "UPDATE credentials SET student_name='Ada Lovelace' WHERE id='$ID'" >/dev/null
+call GET /verify/$ID; expect "restored -> VALID" "$(echo "$BODY" | j "d['verdict']")" VALID
+R=$(DBX "UPDATE approvals SET signature='00' WHERE credential_id='$ID'"); echo "$R" | grep -q 'append-only' && echo "  ok   approvals are append-only" || { echo "  FAIL approvals mutable: $R"; fails=$((fails+1)); }
+
+echo "== key revocation + rotation"
+call GET /keys "$ADM"; UKEY=$(echo "$BODY" | j "[k['id'] for k in d['keys'] if k['role']=='registrar' and k['status']=='active'][0]")
+call POST /keys/$UKEY/revoke "$ADM" '{"reason":"suspected compromise"}'; check "revoke registrar key" 200
+call GET /verify/$ID; expect "revoked key invalidates credential" "$(echo "$BODY" | j "d['verdict']")" INVALID
+call POST /keys/registrar/rotate "$ADM"; check "rotate registrar key" 200
+call POST /credentials "$FAC" "$BODY_C"; ID2=$(echo "$BODY" | j "d['id']"); check "new credential" 201
+call POST /credentials/$ID2/approve "$EXC"; call POST /credentials/$ID2/approve "$REG"; check "registrar signs with rotated key" 200
+call POST /credentials/$ID2/reject "$ADM" '{"reason":"data mismatch"}'; check "admin rejects" 200
+call GET /verify/$ID2; expect "rejected verdict" "$(echo "$BODY" | j "d['verdict']")" REJECTED
+call POST /credentials/$ID/revoke "$ADM" '{"reason":"issued in error"}'; check "admin revokes issued" 200
+call GET /verify/$ID; expect "revoked verdict" "$(echo "$BODY" | j "d['verdict']")" REVOKED
+
+echo "== rate limit"
+for i in $(seq 1 15); do call POST /auth/login "" '{"email":"x@y.z","password":"bad"}'; [ "$CODE" = 429 ] && break; done
+check "login throttled under repeated attempts" 429
+
+echo
+[ $fails -eq 0 ] && echo "ALL CHECKS PASSED" || { echo "$fails CHECK(S) FAILED"; exit 1; }
