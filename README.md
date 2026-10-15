@@ -71,3 +71,12 @@ Authenticated: `GET /auth/me`, `POST /auth/logout`, `GET|POST /credentials`, `GE
 - The encryption key lives in an environment variable. For higher assurance use a KMS/HSM to wrap the signing keys.
 - One signing key per stage, not per person; the audit log records which user triggered each signature.
 - No user-management UI yet: users are rows in `users` (create with `auth::hash_password`-compatible Argon2 hashes).
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+
+## License
+
+[MIT](LICENSE)
