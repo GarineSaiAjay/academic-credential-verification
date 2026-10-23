@@ -12,6 +12,20 @@ pub struct TsaConfig {
     pub timeout: Duration,
 }
 
+/// Request limits. `*_per_min` are per minute; the login-failure limit is per account per window.
+#[derive(Clone)]
+pub struct RateConfig {
+    /// Anonymous requests per client address (the public verification page shares this).
+    pub ip_per_min: u32,
+    /// Signed-in requests per user, so people behind one office address do not share a budget.
+    pub user_per_min: u32,
+    /// Login attempts per client address.
+    pub login_ip_per_min: u32,
+    /// Failed logins per account (whatever the address) before that account is throttled.
+    pub login_account_failures: u32,
+    pub login_account_window_secs: u64,
+}
+
 /// How browsers identify this site to authenticators (WebAuthn relying party).
 #[derive(Clone)]
 pub struct WebAuthnConfig {
@@ -32,6 +46,7 @@ pub struct Config {
     pub bootstrap_admin: Option<(String, String)>,
     pub tsa: Option<TsaConfig>,
     pub webauthn: WebAuthnConfig,
+    pub rate: RateConfig,
     /// Every approval must carry the approver's personal (WebAuthn) countersignature.
     pub require_personal: bool,
     /// Even a person's first key needs an administrator to open the enrolment window.
@@ -42,14 +57,14 @@ fn optional(name: &str) -> Option<String> {
     env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-fn seconds(name: &str, default: u64, min: u64, max: u64) -> Result<u64, String> {
+fn bounded(name: &str, default: u64, min: u64, max: u64) -> Result<u64, String> {
     match optional(name) {
         None => Ok(default),
         Some(v) => v
             .parse::<u64>()
             .ok()
             .filter(|n| (min..=max).contains(n))
-            .ok_or_else(|| format!("{name} must be a number of seconds between {min} and {max}")),
+            .ok_or_else(|| format!("{name} must be a whole number between {min} and {max}")),
     }
 }
 
@@ -139,8 +154,8 @@ impl Config {
                 Some(TsaConfig {
                     url,
                     ca_file: PathBuf::from(ca_file),
-                    interval: Duration::from_secs(seconds("TSA_INTERVAL_SECS", 300, 10, 86_400)?),
-                    timeout: Duration::from_secs(seconds("TSA_TIMEOUT_SECS", 15, 1, 120)?),
+                    interval: Duration::from_secs(bounded("TSA_INTERVAL_SECS", 300, 10, 86_400)?),
+                    timeout: Duration::from_secs(bounded("TSA_TIMEOUT_SECS", 15, 1, 120)?),
                 })
             }
             (None, None) => None,
@@ -150,6 +165,13 @@ impl Config {
             .unwrap_or_else(|_| "http://localhost:3000".into())
             .trim_end_matches('/')
             .to_string();
+        let rate = RateConfig {
+            ip_per_min: bounded("RATE_LIMIT_IP_PER_MIN", 240, 1, 1_000_000)? as u32,
+            user_per_min: bounded("RATE_LIMIT_USER_PER_MIN", 600, 1, 1_000_000)? as u32,
+            login_ip_per_min: bounded("LOGIN_IP_PER_MIN", 10, 1, 10_000)? as u32,
+            login_account_failures: bounded("LOGIN_ACCOUNT_FAILURES", 20, 1, 10_000)? as u32,
+            login_account_window_secs: bounded("LOGIN_ACCOUNT_WINDOW_SECS", 900, 10, 86_400)?,
+        };
         let webauthn = webauthn_config(&public_base_url, optional("WEBAUTHN_RP_ID"))?;
         Ok(Self {
             database_url: required("DATABASE_URL")?,
@@ -164,6 +186,7 @@ impl Config {
             bootstrap_admin,
             tsa,
             webauthn,
+            rate,
             require_personal: optional("REQUIRE_PERSONAL_SIGNATURES").is_some_and(|v| v == "true"),
             require_admin_enrollment: optional("REQUIRE_ADMIN_ENROLLMENT")
                 .is_some_and(|v| v == "true"),

@@ -100,6 +100,19 @@ attack payloads blocked, forged headers ignored) and runs the whole smoke suite 
 It does not talk to Let's Encrypt, so first-time issuance on your real domain is the one thing it cannot prove: watch
 `docker compose -f docker-compose.prod.yml logs edge` on first start.
 
+## Request limits
+
+Limits are counted in Postgres (table `rate_limits`), so they are exact across any number of backend instances and survive restarts, with no extra service to run. A small in-memory check in front sheds floods without touching the database, and if the database is slow or down the limiter falls back to counting per process instead of stalling requests.
+
+| Limit | Default | Setting |
+|---|---|---|
+| Anonymous requests per client address per minute (the public verification page shares this) | 240 | `RATE_LIMIT_IP_PER_MIN` |
+| Signed-in requests per **user** per minute (people behind one office address do not share a budget) | 600 | `RATE_LIMIT_USER_PER_MIN` |
+| Login attempts per client address per minute | 10 | `LOGIN_IP_PER_MIN` |
+| Failed logins per **account**, from any address, per window | 20 per 900 s | `LOGIN_ACCOUNT_FAILURES`, `LOGIN_ACCOUNT_WINDOW_SECS` |
+
+A refused request gets HTTP 429 with a `Retry-After` header. A token is only used to pick a user's bucket after its signature is checked, so an invented token earns no bucket of its own. The per-account throttle also applies to emails that do not exist, so it never reveals which accounts are registered, and throttled attempts are audit-logged as `LOGIN_THROTTLED` (without the password). Start several instances with `docker compose up -d --scale backend=2`; first-start initialisation is serialised so they can boot together. `scripts/ratelimit-test.sh` proves all of this with two instances on one database (also a CI job).
+
 ## Rotating `ENCRYPTION_KEY`
 
 Rotate the key that encrypts the signing keys at rest on a schedule, or whenever someone who had access to it leaves. It needs no downtime and loses nothing.
@@ -207,7 +220,7 @@ scenario (it is part of CI). This protects the keys only: you still need regular
 | RBAC | Role read from the database on every request (demotion/deactivation is immediate); per-endpoint checks |
 | Auth | Argon2id passwords, HS256 JWT bound to a server-side session (logout revokes), 8h expiry, timing-equalised login |
 | Replay protection | Every POST needs `X-Nonce` (single use) and `X-Timestamp` (within 60s) |
-| Rate limiting | 10 logins/min and 240 requests/min per client IP (in-memory, single instance) |
+| Rate limiting | Counted in Postgres, so it holds across instances and restarts: 10 logins/min and 240 anonymous requests/min per client address, 600 requests/min per signed-in user, and failed logins throttled per account (20 per 15 min) whatever the address; configurable |
 | Input / WAF | Field validation, 16 KB body limit, security headers + strict CSP, parameterised SQL only; production stack adds the OWASP Core Rule Set WAF |
 | Container | Backend runs as an unprivileged user (uid 10001) on a read-only filesystem with all capabilities dropped and `no-new-privileges` |
 | Transport | Production stack: automatic HTTPS (TLS 1.2/1.3), HTTP to HTTPS redirect, HSTS; only ports 80/443 exposed |
@@ -225,7 +238,7 @@ Authenticated: `GET /auth/me`, `POST /auth/logout`, `GET|POST /credentials`, `GE
 ## Limits you should know about
 
 - **The ledger is not a public blockchain.** It is a signed, hash-linked Merkle ledger in your own database. On its own it detects tampering, but whoever controls the DB *and* the university key could rewrite history. Configure an external timestamp authority (see above) so that rewriting history would contradict a signature you do not control; without one this limit applies in full.
-- Rate limiting is per process. Run more than one backend instance and you need a shared store (e.g. Redis).
+- Rate limits are fixed windows, so a client can burst up to twice a limit across a window boundary. The per-account login throttle can be used to lock a victim out for the rest of its window by someone who keeps guessing their email; it throttles, it does not disable the account.
 - The built-in WAF is the generic OWASP rule set on a single host. It does not absorb DDoS traffic or replace a managed WAF/CDN; for large-scale exposure put one in front of the edge.
 - The encryption key lives in an environment variable and can be rotated (above), but it is still a plain secret on the host. For higher assurance wrap the signing keys with a KMS/HSM (for example HashiCorp Vault's Transit engine); that is not built in. Losing it is recoverable only if you made a key backup (see above).
 - Stage keys belong to a stage, not a person; for personal accountability use personal signatures (above), which are optional unless `REQUIRE_PERSONAL_SIGNATURES=true`.

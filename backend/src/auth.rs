@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::{
     audit,
     error::{AppError, Res},
-    AppState,
+    security, AppState,
 };
 
 pub const TOKEN_HOURS: i64 = 8;
@@ -85,6 +85,25 @@ struct Claims {
     jti: String,
     iat: i64,
     exp: i64,
+}
+
+/// The user id in a bearer token, if the token's signature and expiry are valid. Used only to choose a
+/// rate-limit bucket, with no database access: a forged or garbage token yields `None` and gets no bucket of
+/// its own (it is counted against the client address instead).
+pub fn verified_subject(headers: &HeaderMap, jwt_secret: &str) -> Option<Uuid> {
+    let token = headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")?;
+    let claims = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(jwt_secret.as_bytes()),
+        &Validation::default(),
+    )
+    .ok()?
+    .claims;
+    claims.sub.parse().ok()
 }
 
 pub fn hash_password(password: &str) -> Res<String> {
@@ -185,10 +204,32 @@ pub async fn login(
     Json(body): Json<LoginBody>,
 ) -> Res<Json<Value>> {
     let ip = client_ip(&headers, peer, st.cfg.trust_proxy);
-    if !st.limiter.check(&format!("login:{ip}"), 10, 60) {
-        return Err(AppError::TooMany);
+    let hit = security::hit(
+        &st,
+        &format!("login:{ip}"),
+        st.cfg.rate.login_ip_per_min,
+        60,
+    )
+    .await;
+    if !hit.allowed {
+        return Err(AppError::TooMany(hit.retry_after));
     }
     let email = body.email.trim().to_lowercase();
+    // Many addresses guessing one account would never trip the per-address limit. This applies equally to
+    // accounts that do not exist, so the response does not reveal which emails are registered.
+    if let Some(wait) = security::account_blocked(&st, &email).await {
+        audit::log(
+            &st.db,
+            None,
+            Some(&email),
+            "LOGIN_THROTTLED",
+            None,
+            None,
+            json!({ "ip": ip }),
+        )
+        .await;
+        return Err(AppError::TooMany(wait));
+    }
     let user: Option<UserRow> =
         sqlx::query_as("SELECT id, password_hash, role, active FROM users WHERE email = $1")
             .bind(&email)
@@ -204,6 +245,7 @@ pub async fn login(
         }
     };
     let Some(user) = user.filter(|_| ok) else {
+        security::account_failure(&st, &email).await;
         audit::log(
             &st.db,
             None,

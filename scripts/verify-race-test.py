@@ -32,8 +32,19 @@ def req(method, path, token=None, body=None):
     if method == "POST":
         h["X-Nonce"] = str(uuid.uuid4())
         h["X-Timestamp"] = str(int(time.time()))
-    r = urllib.request.Request(B + path, method=method, headers=h, data=json.dumps(body).encode() if body is not None else None)
-    return json.load(urllib.request.urlopen(r))
+    for attempt in range(4):
+        r = urllib.request.Request(B + path, method=method, headers=h, data=json.dumps(body).encode() if body is not None else None)
+        try:
+            return json.load(urllib.request.urlopen(r))
+        except urllib.error.HTTPError as e:
+            # Request limits are counted in the database and survive restarts, so a test that follows another
+            # one on the same stack may have to wait out the rest of a window. The server says how long.
+            if e.code != 429 or attempt == 3:
+                raise
+            time.sleep(int(e.headers.get("Retry-After", "5")) + 1)
+            if method == "POST":
+                h["X-Nonce"] = str(uuid.uuid4())
+                h["X-Timestamp"] = str(int(time.time()))
 
 
 def token(user):

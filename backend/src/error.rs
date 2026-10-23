@@ -17,8 +17,9 @@ pub enum AppError {
     NotFound(String),
     #[error("{0}")]
     Conflict(String),
+    /// Carries how many seconds until the caller may try again.
     #[error("too many requests")]
-    TooMany,
+    TooMany(u64),
     #[error("internal error")]
     Internal(String),
 }
@@ -45,12 +46,27 @@ impl IntoResponse for AppError {
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
             AppError::Conflict(_) => StatusCode::CONFLICT,
-            AppError::TooMany => StatusCode::TOO_MANY_REQUESTS,
+            AppError::TooMany(_) => StatusCode::TOO_MANY_REQUESTS,
             AppError::Internal(detail) => {
                 tracing::error!(%detail, "internal error");
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         };
-        (status, Json(json!({ "error": self.to_string() }))).into_response()
+        let retry_after = match &self {
+            AppError::TooMany(secs) => Some(*secs),
+            _ => None,
+        };
+        let mut response = (
+            status,
+            Json(json!({ "error": self.to_string(), "retry_after": retry_after })),
+        )
+            .into_response();
+        if let Some(secs) = retry_after {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(secs),
+            );
+        }
+        response
     }
 }

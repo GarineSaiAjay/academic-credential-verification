@@ -28,7 +28,7 @@ login() { call POST /auth/login "" "{\"email\":\"$1@university.edu\",\"password\
 
 echo "== login"
 FAC=$(login faculty); EXC=$(login examcell); REG=$(login registrar); ADM=$(login admin); AUD=$(login auditor)
-for t in "$FAC" "$EXC" "$REG" "$ADM" "$AUD"; do [ -n "$t" ] || { echo "FAIL: login"; exit 1; }; done
+for t in "$FAC" "$EXC" "$REG" "$ADM" "$AUD"; do [ -n "$t" ] || { echo "FAIL: login ($CODE $BODY)"; [ "$CODE" = 429 ] && echo "      Request limits are counted in the database and survive restarts: wait a minute, or run this against a fresh stack."; exit 1; }; done
 call POST /auth/login "" '{"email":"faculty@university.edu","password":"wrong"}'; check "bad password rejected" 401
 call GET /credentials ""; check "no token rejected" 401
 call GET /credentials "garbage"; check "bad token rejected" 401

@@ -38,6 +38,9 @@ pub struct AppState {
     pub ts_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Advisory-lock id that serialises first-start initialisation across instances.
+const INIT_LOCK: i64 = 0x4143_5653_0001;
+
 const DEMO_USERS: [(&str, &str); 5] = [
     ("faculty@university.edu", "faculty"),
     ("examcell@university.edu", "exam_cell"),
@@ -225,6 +228,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         limiter: Arc::new(RateLimiter::default()),
         ts_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
+    tokio::spawn(security::cleanup_forever(st.db.clone()));
+    // Instances started together (replicas, a rolling restart) must not race to create the first keys and
+    // users: whoever holds this lock initialises, the others wait and then find it done. The lock lives as
+    // long as this transaction, so it is released even if initialisation fails.
+    let init_lock = {
+        let mut tx = st.db.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(INIT_LOCK)
+            .execute(&mut *tx)
+            .await?;
+        tx
+    };
     keys::ensure_initial_keys(&st).await?;
     keys::verify_stored_keys(&st).await?;
     credentials::backfill_events(&st).await?;
@@ -238,6 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "no users exist, so nobody can sign in; set BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD and restart"
         );
     }
+    init_lock.commit().await?;
 
     if let Some(tsa) = &st.cfg.tsa {
         timestamp::preflight(tsa).await?;

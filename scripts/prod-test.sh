@@ -109,7 +109,9 @@ echo "$IPS" | grep -q '203.0.113' && bad "a client-supplied address was trusted:
 echo "$IPS" | grep -qE "172\.29\.250\.(10|11|12)" && bad "audit log shows an internal proxy address: $IPS" || ok "audit log records the real client address, not a proxy ($IPS)"
 
 echo "== the application, end to end through TLS + WAF"
-# The smoke suite uses the whole per-IP login allowance, so start it from a fresh limiter (in memory).
+# The smoke suite uses the whole per-IP login allowance, and limit counters live in the database (they survive
+# restarts), so start it from empty counters.
+docker compose exec -T postgres psql -U acvs -d acvs -qAt -c "DELETE FROM rate_limits" >/dev/null 2>&1
 docker compose restart backend >/dev/null 2>&1 && docker compose up -d --wait >/dev/null 2>&1 && ok "backend restarted cleanly" || bad "backend did not come back"
 CURL_CA_BUNDLE="$T/root.crt" ./scripts/smoke.sh https://localhost > "$T/smoke.out" 2>&1
 tail -3 "$T/smoke.out" | sed 's/^/    /'

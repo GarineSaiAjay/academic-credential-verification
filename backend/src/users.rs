@@ -13,7 +13,7 @@ use crate::{
     audit,
     auth::{self, AuthUser, Role},
     error::{AppError, Res},
-    AppState,
+    security, AppState,
 };
 
 pub const MIN_PASSWORD: usize = 12;
@@ -344,8 +344,9 @@ pub async fn change_password(
     user: AuthUser,
     Json(b): Json<ChangeBody>,
 ) -> Res<Json<Value>> {
-    if !st.limiter.check(&format!("pwchange:{}", user.id), 10, 60) {
-        return Err(AppError::TooMany);
+    let hit = security::hit(&st, &format!("pwchange:{}", user.id), 10, 60).await;
+    if !hit.allowed {
+        return Err(AppError::TooMany(hit.retry_after));
     }
     check_password(&b.new_password)?;
     if b.new_password == b.current_password {
