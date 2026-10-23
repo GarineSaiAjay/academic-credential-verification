@@ -1,5 +1,7 @@
 use std::{env, path::PathBuf, time::Duration};
 
+use crate::crypto::KeyRing;
+
 /// External RFC 3161 time-stamping authority that every sealed block is anchored to.
 #[derive(Clone)]
 pub struct TsaConfig {
@@ -21,7 +23,8 @@ pub struct WebAuthnConfig {
 pub struct Config {
     pub database_url: String,
     pub jwt_secret: String,
-    pub enc_key: [u8; 32],
+    /// ENCRYPTION_KEY (current) plus ENCRYPTION_KEY_PREVIOUS (still readable during a rotation).
+    pub enc_key: KeyRing,
     pub bind: String,
     pub public_base_url: String,
     pub trust_proxy: bool,
@@ -76,6 +79,13 @@ fn webauthn_config(
     })
 }
 
+fn parse_key(name: &str, hex_key: &str) -> Result<[u8; 32], String> {
+    hex::decode(hex_key)
+        .map_err(|_| format!("{name} must be hex"))?
+        .try_into()
+        .map_err(|_| format!("{name} must be 32 bytes (64 hex chars)"))
+}
+
 fn required(name: &str) -> Result<String, String> {
     env::var(name).map_err(|_| format!("{name} must be set"))
 }
@@ -86,10 +96,28 @@ impl Config {
         if jwt_secret.len() < 32 {
             return Err("JWT_SECRET must be at least 32 characters".into());
         }
-        let enc_key: [u8; 32] = hex::decode(required("ENCRYPTION_KEY")?)
-            .map_err(|_| "ENCRYPTION_KEY must be hex".to_string())?
-            .try_into()
-            .map_err(|_| "ENCRYPTION_KEY must be 32 bytes (64 hex chars)".to_string())?;
+        let current = parse_key("ENCRYPTION_KEY", &required("ENCRYPTION_KEY")?)?;
+        let mut previous = vec![];
+        for (i, part) in optional("ENCRYPTION_KEY_PREVIOUS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .enumerate()
+        {
+            let key = parse_key("ENCRYPTION_KEY_PREVIOUS", part)?;
+            if key == current || previous.contains(&key) {
+                return Err(format!(
+                    "ENCRYPTION_KEY_PREVIOUS entry {} repeats another key",
+                    i + 1
+                ));
+            }
+            previous.push(key);
+        }
+        if previous.len() > 4 {
+            return Err("ENCRYPTION_KEY_PREVIOUS may list at most 4 keys".into());
+        }
+        let enc_key = KeyRing::new(current, previous);
         let bootstrap_admin = match (
             optional("BOOTSTRAP_ADMIN_EMAIL"),
             optional("BOOTSTRAP_ADMIN_PASSWORD"),

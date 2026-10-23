@@ -100,6 +100,25 @@ attack payloads blocked, forged headers ignored) and runs the whole smoke suite 
 It does not talk to Let's Encrypt, so first-time issuance on your real domain is the one thing it cannot prove: watch
 `docker compose -f docker-compose.prod.yml logs edge` on first start.
 
+## Rotating `ENCRYPTION_KEY`
+
+Rotate the key that encrypts the signing keys at rest on a schedule, or whenever someone who had access to it leaves. It needs no downtime and loses nothing.
+
+```bash
+# 1. Make a new key and keep the old one for now. In .env:
+#      ENCRYPTION_KEY=<new key>            (openssl rand -hex 32)
+#      ENCRYPTION_KEY_PREVIOUS=<old key>
+docker compose up -d                        # reads data under either key, writes under the new one
+
+# 2. Re-encrypt every stored signing key under the new key (add --dry-run to preview; nothing is saved).
+docker compose run --rm -T backend ./server key-rewrap
+
+# 3. Remove ENCRYPTION_KEY_PREVIOUS from .env and restart. Now destroy the old key.
+docker compose up -d
+```
+
+Every stored key carries a small header naming the key that sealed it, so the server knows which key to use. `key-rewrap` moves **all** stored signing keys, including retired and revoked ones and ones written before the header existed, in a single transaction: either every key moves or none does, and it refuses (changing nothing) if any key cannot be opened. Until it has run, the server logs a warning on every start. A server started with only the new key refuses to start and says to keep the old one in `ENCRYPTION_KEY_PREVIOUS`. The passphrase-protected key backup is independent of this key and unaffected. `JWT_SECRET` is a separate secret: changing it signs everyone out. `scripts/rotation-test.sh` runs this whole procedure (also a CI job).
+
 ## Anchoring the ledger to an external timestamp authority
 
 The ledger on its own is only as trustworthy as the database and the university key: whoever controls both could rewrite
@@ -208,7 +227,7 @@ Authenticated: `GET /auth/me`, `POST /auth/logout`, `GET|POST /credentials`, `GE
 - **The ledger is not a public blockchain.** It is a signed, hash-linked Merkle ledger in your own database. On its own it detects tampering, but whoever controls the DB *and* the university key could rewrite history. Configure an external timestamp authority (see above) so that rewriting history would contradict a signature you do not control; without one this limit applies in full.
 - Rate limiting is per process. Run more than one backend instance and you need a shared store (e.g. Redis).
 - The built-in WAF is the generic OWASP rule set on a single host. It does not absorb DDoS traffic or replace a managed WAF/CDN; for large-scale exposure put one in front of the edge.
-- The encryption key lives in an environment variable. For higher assurance use a KMS/HSM to wrap the signing keys. Losing it is recoverable only if you made a key backup (see above).
+- The encryption key lives in an environment variable and can be rotated (above), but it is still a plain secret on the host. For higher assurance wrap the signing keys with a KMS/HSM (for example HashiCorp Vault's Transit engine); that is not built in. Losing it is recoverable only if you made a key backup (see above).
 - Stage keys belong to a stage, not a person; for personal accountability use personal signatures (above), which are optional unless `REQUIRE_PERSONAL_SIGNATURES=true`.
 - No account lockout, MFA or self-service password *reset* (forgot password); an admin can reset a password for a user.
 

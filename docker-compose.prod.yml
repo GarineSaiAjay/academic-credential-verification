@@ -28,6 +28,7 @@ services:
       DATABASE_URL: postgresql://acvs:${POSTGRES_PASSWORD}@postgres:5432/acvs
       JWT_SECRET: ${JWT_SECRET:?run scripts/gen-env.sh}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?run scripts/gen-env.sh}
+      ENCRYPTION_KEY_PREVIOUS: ${ENCRYPTION_KEY_PREVIOUS:-}
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
       PUBLIC_BASE_URL: https://${DOMAIN:?set DOMAIN in .env}

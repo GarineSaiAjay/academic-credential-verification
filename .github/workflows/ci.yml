@@ -81,3 +81,11 @@ jobs:
       - run: PASS=$(grep '^SEED_DEMO_PASSWORD=' .env | cut -d= -f2) REPO=$PWD node e2e/browser.mjs
       - if: failure()
         run: docker compose logs
+
+  e2e-rotation:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/gen-env.sh
+      - run: ./scripts/rotation-test.sh

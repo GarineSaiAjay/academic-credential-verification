@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{crypto, keys::KEY_ROLES};
+use crate::{
+    crypto::{self, KeyRing},
+    keys::{self, KEY_ROLES},
+};
 
 type R<T> = Result<T, String>;
 
@@ -170,7 +173,7 @@ fn decrypt(text: &str, passphrase: &str) -> R<Vec<BackupKey>> {
 type KeyRow = (Uuid, String, String, Vec<u8>, DateTime<Utc>);
 
 /// Returns the encrypted backup file and how many keys it holds. Needs the *current* `ENCRYPTION_KEY`.
-pub async fn backup(db: &PgPool, enc_key: &[u8; 32], passphrase: &str) -> R<(String, usize)> {
+pub async fn backup(db: &PgPool, ring: &KeyRing, passphrase: &str) -> R<(String, usize)> {
     check_passphrase(passphrase)?;
     let rows: Vec<KeyRow> = sqlx::query_as(
         "SELECT id, role, public_key, private_key_enc, created_at FROM signing_keys WHERE status = 'active' ORDER BY role",
@@ -188,7 +191,7 @@ pub async fn backup(db: &PgPool, enc_key: &[u8; 32], passphrase: &str) -> R<(Str
             role: role.clone(),
             public_key,
             seed: hex::encode(
-                crypto::open(enc_key, &blob)
+                ring.open(&blob)
                     .ok_or_else(|| format!("ENCRYPTION_KEY cannot decrypt the '{role}' key; back up while the correct key is configured"))?,
             ),
             created_at,
@@ -210,10 +213,10 @@ pub struct Report {
     pub skipped: Vec<String>,
 }
 
-/// Re-encrypts the backed-up keys under `enc_key` in one transaction; with `dry_run` nothing is saved.
+/// Re-encrypts the backed-up keys under the ring's current key in one transaction; with `dry_run` nothing is saved.
 pub async fn restore(
     db: &PgPool,
-    enc_key: &[u8; 32],
+    ring: &KeyRing,
     passphrase: &str,
     text: &str,
     dry_run: bool,
@@ -245,7 +248,7 @@ pub async fn restore(
                 }
                 sqlx::query("UPDATE signing_keys SET private_key_enc = $2 WHERE id = $1")
                     .bind(k.id)
-                    .bind(crypto::seal(enc_key, &seed))
+                    .bind(ring.seal(&seed))
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| e.to_string())?;
@@ -271,7 +274,7 @@ pub async fn restore(
                 .bind(k.id)
                 .bind(&k.role)
                 .bind(&k.public_key)
-                .bind(crypto::seal(enc_key, &seed))
+                .bind(ring.seal(&seed))
                 .bind(k.created_at)
                 .execute(&mut *tx)
                 .await
@@ -294,24 +297,43 @@ pub const USAGE: &str = "usage:
   server key-restore [--in FILE] [--dry-run]
                                  re-encrypt the backed-up keys under the current ENCRYPTION_KEY
                                  (reads the backup from FILE, or stdin)
-the passphrase comes from the KEY_BACKUP_PASSPHRASE environment variable";
+  server key-rewrap [--dry-run]  re-encrypt every stored signing key under the current ENCRYPTION_KEY
+                                 (rotation: set the new key as ENCRYPTION_KEY and the old one in
+                                 ENCRYPTION_KEY_PREVIOUS, run this, then remove ENCRYPTION_KEY_PREVIOUS)
+key-backup and key-restore take the passphrase from the KEY_BACKUP_PASSPHRASE environment variable";
 
 pub fn is_command(arg: &str) -> bool {
-    matches!(arg, "key-backup" | "key-restore")
+    matches!(arg, "key-backup" | "key-restore" | "key-rewrap")
 }
 
-pub async fn cli(db: &PgPool, enc_key: &[u8; 32], args: &[String]) -> R<()> {
+pub async fn cli(db: &PgPool, ring: &KeyRing, args: &[String]) -> R<()> {
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    if args[0] == "key-rewrap" {
+        let r = keys::rewrap(db, ring, dry_run).await?;
+        let verb = if dry_run { "would be " } else { "" };
+        eprintln!(
+            "{}{} key(s) {verb}re-encrypted under key {}, {} already under it",
+            if dry_run {
+                "dry run, nothing saved; "
+            } else {
+                ""
+            },
+            r.rewrapped,
+            ring.current_id(),
+            r.already_current
+        );
+        return Ok(());
+    }
     let passphrase = env::var(PASSPHRASE_ENV).map_err(|_| format!("set {PASSPHRASE_ENV}"))?;
     match args[0].as_str() {
         "key-backup" => {
-            let (text, n) = backup(db, enc_key, &passphrase).await?;
+            let (text, n) = backup(db, ring, &passphrase).await?;
             println!("{text}");
             eprintln!(
                 "backed up {n} active signing key(s). Store this file and its passphrase apart from .env and from database backups."
             );
         }
         _ => {
-            let dry_run = args.iter().any(|a| a == "--dry-run");
             let mut text = String::new();
             match args.iter().position(|a| a == "--in") {
                 Some(i) => {
@@ -324,7 +346,7 @@ pub async fn cli(db: &PgPool, enc_key: &[u8; 32], args: &[String]) -> R<()> {
                         .map_err(|e| e.to_string())?;
                 }
             }
-            let r = restore(db, enc_key, &passphrase, &text, dry_run).await?;
+            let r = restore(db, ring, &passphrase, &text, dry_run).await?;
             let mut err = std::io::stderr();
             let verb = if dry_run { "would be " } else { "" };
             for (name, list) in [
