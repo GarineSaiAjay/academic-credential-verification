@@ -135,6 +135,7 @@ scenario (it is part of CI). This protects the keys only: you still need regular
 | Replay protection | Every POST needs `X-Nonce` (single use) and `X-Timestamp` (within 60s) |
 | Rate limiting | 10 logins/min and 240 requests/min per client IP (in-memory, single instance) |
 | Input / WAF | Field validation, 16 KB body limit, security headers + strict CSP, parameterised SQL only; production stack adds the OWASP Core Rule Set WAF |
+| Container | Backend runs as an unprivileged user (uid 10001) on a read-only filesystem with all capabilities dropped and `no-new-privileges` |
 | Transport | Production stack: automatic HTTPS (TLS 1.2/1.3), HTTP to HTTPS redirect, HSTS; only ports 80/443 exposed |
 | Secrets | `.env` generated locally and git-ignored; CI generates throwaway secrets |
 | CI/CD | GitHub Actions: fmt, clippy `-D warnings`, unit tests, front end build, full-stack smoke test |

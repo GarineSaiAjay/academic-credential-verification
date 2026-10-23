@@ -145,6 +145,15 @@ done
 expect "audit never stores passwords" "$(echo "$BODY" | grep -c -e "$P1" -e "$P2" -e "$P3")" 0
 call POST /users/$UID_/active "$ADM" '{"active":false}'; check "cleanup: deactivate smoke user" 200
 
+echo "== container hardening (backend)"
+BX() { docker compose exec -T backend sh -c "$1" 2>&1; }
+expect "backend runs as an unprivileged user" "$(BX 'id -u' | tr -d '\r')" 10001
+expect "backend has no effective capabilities" "$(BX "grep '^CapEff' /proc/self/status" | awk '{print $2}')" 0000000000000000
+expect "backend cannot gain privileges" "$(BX "grep '^NoNewPrivs' /proc/self/status" | awk '{print $2}')" 1
+[[ "$(BX 'touch /probe')" == *"Read-only file system"* ]] && echo "  ok   root filesystem is read-only" || { echo "  FAIL root filesystem is writable"; fails=$((fails+1)); }
+[[ "$(BX 'touch /app/probe')" == *"Read-only file system"* ]] && echo "  ok   application directory is read-only" || { echo "  FAIL application directory is writable"; fails=$((fails+1)); }
+BX 'touch /tmp/probe && rm /tmp/probe' >/dev/null && echo "  ok   /tmp is writable scratch space" || { echo "  FAIL /tmp not writable"; fails=$((fails+1)); }
+
 echo "== rate limit"
 for i in $(seq 1 15); do call POST /auth/login "" '{"email":"x@y.z","password":"bad"}'; [ "$CODE" = 429 ] && break; done
 check "login throttled under repeated attempts" 429

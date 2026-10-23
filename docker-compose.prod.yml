@@ -33,6 +33,14 @@ services:
       PUBLIC_BASE_URL: https://${DOMAIN:?set DOMAIN in .env}
       TRUST_PROXY: "true"
       RUST_LOG: info
+    # The API writes nothing to disk, so it runs unprivileged on a read-only filesystem with no capabilities.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 5s
