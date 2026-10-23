@@ -31,6 +31,10 @@ services:
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
       PUBLIC_BASE_URL: https://${DOMAIN:?set DOMAIN in .env}
+      TSA_URL: ${TSA_URL:-}
+      TSA_CA_FILE: ${TSA_CA_FILE:-}
+      TSA_INTERVAL_SECS: ${TSA_INTERVAL_SECS:-}
+      TSA_TIMEOUT_SECS: ${TSA_TIMEOUT_SECS:-}
       TRUST_PROXY: "true"
       RUST_LOG: info
     # The API writes nothing to disk, so it runs unprivileged on a read-only filesystem with no capabilities.
@@ -41,6 +45,8 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    volumes:
+      - ./deploy/tsa:/etc/acvs/tsa:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 5s

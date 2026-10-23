@@ -8,6 +8,7 @@ mod keybackup;
 mod keys;
 mod ledger;
 mod security;
+mod timestamp;
 mod users;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -32,6 +33,8 @@ pub struct AppState {
     pub db: sqlx::PgPool,
     pub cfg: Arc<Config>,
     pub limiter: Arc<RateLimiter>,
+    /// Held while a timestamping pass runs, so passes in this process never overlap.
+    pub ts_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 const DEMO_USERS: [(&str, &str); 5] = [
@@ -72,7 +75,19 @@ pub fn router(st: AppState) -> Router {
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/verify/:id", get(credentials::verify))
         .route("/api/v1/credentials/:id/qr", get(credentials::qr))
-        .route("/api/v1/ledger/verify", get(ledger::verify_chain));
+        .route("/api/v1/ledger/verify", get(ledger::verify_chain))
+        .route(
+            "/api/v1/ledger/blocks/:height/timestamp",
+            get(timestamp::show),
+        )
+        .route(
+            "/api/v1/ledger/blocks/:height/timestamp.tsq",
+            get(timestamp::raw_request),
+        )
+        .route(
+            "/api/v1/ledger/blocks/:height/timestamp.tsr",
+            get(timestamp::raw_response),
+        );
 
     let reads = Router::new()
         .route("/api/v1/auth/me", get(auth::me))
@@ -100,6 +115,7 @@ pub fn router(st: AppState) -> Router {
         .route("/api/v1/keys/:role/rotate", post(keys::rotate))
         .route("/api/v1/keys/:id/revoke", post(keys::revoke))
         .route("/api/v1/ledger/seal", post(ledger::seal))
+        .route("/api/v1/ledger/timestamp", post(timestamp::run_now))
         .route_layer(middleware::from_fn_with_state(
             st.clone(),
             security::replay_guard,
@@ -184,6 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db,
         cfg: Arc::new(cfg),
         limiter: Arc::new(RateLimiter::default()),
+        ts_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     keys::ensure_initial_keys(&st).await?;
     keys::verify_stored_keys(&st).await?;
@@ -196,6 +213,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!(
             "no users exist, so nobody can sign in; set BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD and restart"
         );
+    }
+
+    if let Some(tsa) = &st.cfg.tsa {
+        timestamp::preflight(tsa).await?;
+        tracing::info!(url = %tsa.url, "anchoring sealed blocks to an external timestamp authority");
+        tokio::spawn(timestamp::run_forever(st.clone()));
     }
 
     let listener = tokio::net::TcpListener::bind(&st.cfg.bind).await?;

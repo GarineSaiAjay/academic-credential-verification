@@ -62,6 +62,9 @@ call POST /ledger/seal "$ADM"; check "admin seals block" 200
 call POST /ledger/seal "$ADM"; check "nothing left to seal" 409
 call GET /verify/$ID; expect "anchored + proof ok" "$(echo "$BODY" | j "d['anchor']['ok']")" True
 call GET /ledger/verify; expect "chain ok" "$(echo "$BODY" | j "d['ok']")" True
+call GET /ledger/blocks/1/timestamp ""; check "no external timestamp when no authority is configured" 404
+call POST /ledger/timestamp "$ADM"; check "timestamping run refused when not configured" 409
+call GET /ledger/blocks "$ADM"; expect "block list reports timestamping off" "$(echo "$BODY" | j "d['timestamping']")" None
 
 echo "== security"
 call POST /credentials/$ID/revoke "$FAC" '{"reason":"nope"}'; check "faculty cannot revoke" 403

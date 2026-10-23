@@ -97,6 +97,44 @@ attack payloads blocked, forged headers ignored) and runs the whole smoke suite 
 It does not talk to Let's Encrypt, so first-time issuance on your real domain is the one thing it cannot prove: watch
 `docker compose -f docker-compose.prod.yml logs edge` on first start.
 
+## Anchoring the ledger to an external timestamp authority
+
+The ledger on its own is only as trustworthy as the database and the university key: whoever controls both could rewrite
+history and re-sign it. To close that gap, set `TSA_URL` and `TSA_CA_FILE` and every sealed block's hash is also sent to
+an independent [RFC 3161](https://www.rfc-editor.org/rfc/rfc3161) time-stamping authority (TSA), which returns a token,
+signed with its own key, saying "this digest existed at this time". Each block hash covers the previous one, so a token for
+block N pins the whole chain up to N; changing anything earlier would contradict a signature the university does not hold.
+
+```bash
+# 1. Put the TSA's root certificate in deploy/tsa/ca.pem (from the TSA's own site, over HTTPS; check its fingerprint).
+# 2. In .env:
+TSA_URL=https://freetsa.org/tsr
+TSA_CA_FILE=/etc/acvs/tsa/ca.pem
+# 3. docker compose up -d
+```
+
+- A token is stored only after `openssl ts -verify` accepts it against your CA file, so a reply signed by anyone else is
+  rejected. It is also checked at the time stamped in it, so it stays valid after the TSA's certificate expires.
+- Timestamping happens right after sealing and is retried every `TSA_INTERVAL_SECS` (default 300) for blocks the TSA could
+  not stamp, for example during an outage. Admins can also press **Timestamp pending blocks now** on the Ledger page
+  (`POST /ledger/timestamp`). A block without a token is simply "pending"; credentials in it stay `VALID`.
+- Tokens are immutable in the database (`block_timestamps`). The ledger page, the credential verification page
+  and `GET /ledger/verify` show them; `GET /ledger/blocks/:n/timestamp` re-verifies one and returns it.
+- **Anyone can check it without trusting this server**, using only the TSA's certificate:
+
+```bash
+curl -O https://HOST/api/v1/ledger/blocks/1/timestamp.tsq -O https://HOST/api/v1/ledger/blocks/1/timestamp.tsr
+openssl ts -verify -queryfile timestamp.tsq -in timestamp.tsr -CAfile tsa-ca.pem     # Verification: OK
+```
+
+  The request holds the block hash (`GET /ledger/blocks` lists it; it is recomputable from the block's fields), and
+  OpenSSL confirms the TSA signed exactly that digest with a certificate chaining to its root.
+- Limits: this proves the chain existed by the stamped time; it does not make the ledger a public blockchain. You trust the TSA
+  (use more than one if that worries you), and revocation (CRL/OCSP) of the TSA's key is not checked. The backend image
+  ships the `openssl` command line for this. `TSA_URL` may be `http://` because the reply is signed; use `https://` anyway.
+- `scripts/timestamp-test.sh` runs the whole flow against a throwaway authority that can answer correctly, with an untrusted
+  key, with garbage, or not at all (also run in CI).
+
 ## Backing up and recovering the signing keys
 
 Private signing keys live in the database, encrypted under `ENCRYPTION_KEY`. **If `ENCRYPTION_KEY` is lost, they cannot be
@@ -150,7 +188,7 @@ Authenticated: `GET /auth/me`, `POST /auth/logout`, `GET|POST /credentials`, `GE
 
 ## Limits you should know about
 
-- **The ledger is not a public blockchain.** It is a signed, hash-linked Merkle ledger in your own database. It detects tampering, but whoever controls the DB *and* the university key could rewrite history. To get public-chain guarantees, publish each block's `merkle_root` to a chain (or a timestamping service) after sealing; the data model already carries what you need.
+- **The ledger is not a public blockchain.** It is a signed, hash-linked Merkle ledger in your own database. On its own it detects tampering, but whoever controls the DB *and* the university key could rewrite history. Configure an external timestamp authority (see above) so that rewriting history would contradict a signature you do not control; without one this limit applies in full.
 - Rate limiting is per process. Run more than one backend instance and you need a shared store (e.g. Redis).
 - The built-in WAF is the generic OWASP rule set on a single host. It does not absorb DDoS traffic or replace a managed WAF/CDN; for large-scale exposure put one in front of the edge.
 - The encryption key lives in an environment variable. For higher assurance use a KMS/HSM to wrap the signing keys. Losing it is recoverable only if you made a key backup (see above).

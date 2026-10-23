@@ -1,4 +1,14 @@
-use std::env;
+use std::{env, path::PathBuf, time::Duration};
+
+/// External RFC 3161 time-stamping authority that every sealed block is anchored to.
+#[derive(Clone)]
+pub struct TsaConfig {
+    pub url: String,
+    /// PEM file with the root certificate(s) the TSA's signing certificate must chain to.
+    pub ca_file: PathBuf,
+    pub interval: Duration,
+    pub timeout: Duration,
+}
 
 #[derive(Clone)]
 pub struct Config {
@@ -10,10 +20,22 @@ pub struct Config {
     pub trust_proxy: bool,
     pub seed_password: Option<String>,
     pub bootstrap_admin: Option<(String, String)>,
+    pub tsa: Option<TsaConfig>,
 }
 
 fn optional(name: &str) -> Option<String> {
     env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn seconds(name: &str, default: u64, min: u64, max: u64) -> Result<u64, String> {
+    match optional(name) {
+        None => Ok(default),
+        Some(v) => v
+            .parse::<u64>()
+            .ok()
+            .filter(|n| (min..=max).contains(n))
+            .ok_or_else(|| format!("{name} must be a number of seconds between {min} and {max}")),
+    }
 }
 
 fn required(name: &str) -> Result<String, String> {
@@ -43,6 +65,21 @@ impl Config {
                 )
             }
         };
+        let tsa = match (optional("TSA_URL"), optional("TSA_CA_FILE")) {
+            (Some(url), Some(ca_file)) => {
+                if !(url.starts_with("https://") || url.starts_with("http://")) {
+                    return Err("TSA_URL must start with https:// or http://".into());
+                }
+                Some(TsaConfig {
+                    url,
+                    ca_file: PathBuf::from(ca_file),
+                    interval: Duration::from_secs(seconds("TSA_INTERVAL_SECS", 300, 10, 86_400)?),
+                    timeout: Duration::from_secs(seconds("TSA_TIMEOUT_SECS", 15, 1, 120)?),
+                })
+            }
+            (None, None) => None,
+            _ => return Err("TSA_URL and TSA_CA_FILE must be set together".into()),
+        };
         Ok(Self {
             database_url: required("DATABASE_URL")?,
             jwt_secret,
@@ -57,6 +94,7 @@ impl Config {
                 .unwrap_or(false),
             seed_password: optional("SEED_DEMO_PASSWORD"),
             bootstrap_admin,
+            tsa,
         })
     }
 }

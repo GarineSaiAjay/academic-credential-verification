@@ -10,7 +10,7 @@ use crate::{
     credentials::CredRow,
     crypto::{self, merkle, Step},
     error::{AppError, Res},
-    keys, AppState,
+    keys, timestamp, AppState,
 };
 
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -65,6 +65,8 @@ pub struct Anchor {
     pub leaf_index: i32,
     pub proof: Vec<Step>,
     pub timestamp: i64,
+    /// Proof from an external time-stamping authority, if the block has one yet.
+    pub external_timestamp: Option<Value>,
     pub ok: bool,
 }
 
@@ -82,6 +84,7 @@ pub async fn anchor_for(db: &PgPool, c: &CredRow) -> Res<Option<Anchor>> {
     let ok = block_ok
         && leaves.get(index as usize) == Some(&c.credential_hash)
         && merkle::verify(&c.credential_hash, &proof, &b.merkle_root);
+    let external_timestamp = timestamp::summary(db, b.height, &b.block_hash).await?;
     Ok(Some(Anchor {
         height,
         block_hash: b.block_hash,
@@ -89,6 +92,7 @@ pub async fn anchor_for(db: &PgPool, c: &CredRow) -> Res<Option<Anchor>> {
         leaf_index: index,
         proof,
         timestamp: b.ts,
+        external_timestamp,
         ok,
     }))
 }
@@ -135,6 +139,13 @@ pub async fn seal(State(st): State<AppState>, user: AuthUser) -> Res<Json<Value>
     }
     tx.commit().await?;
 
+    if st.cfg.tsa.is_some() {
+        let st = st.clone();
+        tokio::spawn(async move {
+            timestamp::timestamp_pending(&st).await;
+        });
+    }
+
     audit::actor_log(
         &st.db,
         &user,
@@ -158,12 +169,18 @@ pub async fn blocks(State(st): State<AppState>, _user: AuthUser) -> Res<Json<Val
     )
     .fetch_one(&st.db)
     .await?;
-    Ok(Json(json!({
-        "pending_unanchored": pending.0,
-        "blocks": rows.iter().map(|b| json!({
+    let mut blocks = vec![];
+    for b in &rows {
+        blocks.push(json!({
             "height": b.height, "prev_hash": b.prev_hash, "merkle_root": b.merkle_root, "block_hash": b.block_hash,
             "timestamp": b.ts, "credentials": b.leaves().len(),
-        })).collect::<Vec<_>>(),
+            "external_timestamp": timestamp::summary(&st.db, b.height, &b.block_hash).await?,
+        }));
+    }
+    Ok(Json(json!({
+        "pending_unanchored": pending.0,
+        "timestamping": st.cfg.tsa.as_ref().map(|t| json!({ "url": t.url })),
+        "blocks": blocks,
     })))
 }
 
@@ -189,9 +206,11 @@ pub async fn verify_chain(State(st): State<AppState>) -> Res<Json<Value>> {
             .iter()
             .map(|(h,)| h.as_str())
             .eq(leaves.iter().map(String::as_str));
-        let ok = block_ok && linked && leaves_ok;
+        // A stored timestamp must be about this very block; a block without one is merely not stamped yet.
+        let stamp = timestamp::chain_status(&st.db, b.height, &b.block_hash).await?;
+        let ok = block_ok && linked && leaves_ok && stamp != "mismatch";
         all_ok &= ok;
-        report.push(json!({ "height": b.height, "ok": ok, "linked": linked, "block_ok": block_ok, "leaves_match_credentials": leaves_ok, "key_status": key_status }));
+        report.push(json!({ "height": b.height, "ok": ok, "linked": linked, "block_ok": block_ok, "leaves_match_credentials": leaves_ok, "key_status": key_status, "external_timestamp": stamp }));
         prev = b.block_hash.clone();
     }
     Ok(Json(

@@ -229,6 +229,15 @@ export function Verify({ id, h }: { id?: string; h?: string }) {
                 <tr><th>Block hash</th><td className="mono">{v.anchor.block_hash}</td></tr>
                 <tr><th>Merkle root</th><td className="mono">{v.anchor.merkle_root}</td></tr>
                 <tr><th>Proof</th><td>{v.anchor.proof.length} step(s), leaf index {v.anchor.leaf_index}</td></tr>
+                <tr>
+                  <th>External timestamp</th>
+                  {v.anchor.external_timestamp ? (
+                    <td className={v.anchor.external_timestamp.imprint_ok ? 'good' : 'bad'}>
+                      {v.anchor.external_timestamp.imprint_ok ? `signed ${when(v.anchor.external_timestamp.time)} by ${v.anchor.external_timestamp.tsa}` : 'MISMATCH: the timestamp is not for this block'}
+                      {' '}<a href={`/api/v1/ledger/blocks/${v.anchor.height}/timestamp.tsr`}>token</a>
+                    </td>
+                  ) : <td className="muted">not yet timestamped by an outside authority</td>}
+                </tr>
               </tbody></table>
             </Card>
           )}
@@ -280,14 +289,15 @@ export function Ledger({ role }: { role: Role }) {
       {banner}<Err msg={error} />
       <div className="toolbar">
         {role === 'university_admin' && <button onClick={() => run(() => api('POST', '/ledger/seal'), 'Block sealed', reload)}>Seal {data ? data.pending_unanchored : ''} issued credential(s) into a block</button>}
+        {role === 'university_admin' && data?.timestamping && <button onClick={() => run(async () => { const r = await api<{ stamped: number; failed: { height: number; error: string }[] }>('POST', '/ledger/timestamp'); if (r.failed.length) throw new Error(`Block ${r.failed[0].height}: ${r.failed[0].error}`); return r; }, 'Pending blocks timestamped', reload)}>Timestamp pending blocks now</button>}
         <button onClick={() => api('GET', '/ledger/verify').then(setChain)}>Verify whole chain</button>
         {chain && <span className={chain.ok ? 'good' : 'bad'}>{chain.ok ? `chain intact (${chain.length} blocks)` : 'CHAIN BROKEN'}</span>}
       </div>
       <table>
-        <thead><tr><th>#</th><th>Credentials</th><th>Merkle root</th><th>Block hash</th><th>Sealed</th></tr></thead>
+        <thead><tr><th>#</th><th>Credentials</th><th>Merkle root</th><th>Block hash</th><th>Sealed</th>{data?.timestamping && <th>External timestamp</th>}</tr></thead>
         <tbody>
           {data?.blocks.map((b: any) => (
-            <tr key={b.height}><td>{b.height}</td><td>{b.credentials}</td><td className="mono">{short(b.merkle_root, 16)}…</td><td className="mono">{short(b.block_hash, 16)}…</td><td>{when(b.timestamp)}</td></tr>
+            <tr key={b.height}><td>{b.height}</td><td>{b.credentials}</td><td className="mono">{short(b.merkle_root, 16)}…</td><td className="mono">{short(b.block_hash, 16)}…</td><td>{when(b.timestamp)}</td>{data.timestamping && <td>{b.external_timestamp ? <a href={`#/ledger`} onClick={(e) => { e.preventDefault(); api('GET', `/ledger/blocks/${b.height}/timestamp`).then((t) => window.alert(`${t.verified ? 'Verified' : 'NOT VERIFIED'}\nsigned ${when(t.time)} by ${t.tsa}\nserial ${t.serial}${t.error ? `\n${t.error}` : ''}`)); }}>{when(b.external_timestamp.time)}</a> : <span className="muted">pending</span>}</td>}</tr>
           ))}
         </tbody>
       </table>
