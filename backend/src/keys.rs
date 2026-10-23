@@ -26,19 +26,60 @@ async fn insert_key<'e>(e: impl PgExecutor<'e>, enc: &[u8; 32], role: &str) -> R
     Ok(id)
 }
 
+/// Creates a stage's first key on a fresh install. A stage that already has keys but none active
+/// (its key was revoked and not yet rotated) is left alone, so a restart cannot undo the revocation.
 pub async fn ensure_initial_keys(st: &AppState) -> Res<()> {
     for role in KEY_ROLES {
-        let exists: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM signing_keys WHERE role = $1 AND status = 'active'")
+        let any: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM signing_keys WHERE role = $1 LIMIT 1")
                 .bind(role)
                 .fetch_optional(&st.db)
                 .await?;
-        if exists.is_none() {
-            insert_key(&st.db, &st.cfg.enc_key, role).await?;
-            tracing::info!(role, "generated initial signing key");
+        if any.is_some() {
+            let active: Option<(Uuid,)> =
+                sqlx::query_as("SELECT id FROM signing_keys WHERE role = $1 AND status = 'active'")
+                    .bind(role)
+                    .fetch_optional(&st.db)
+                    .await?;
+            if active.is_none() {
+                tracing::warn!(
+                    role,
+                    "no active signing key (revoked?); rotate one to resume signing"
+                );
+            }
+            continue;
         }
+        insert_key(&st.db, &st.cfg.enc_key, role).await?;
+        tracing::info!(role, "generated initial signing key");
     }
     Ok(())
+}
+
+/// Fails startup when ENCRYPTION_KEY cannot open the stored active keys, so a lost or changed key
+/// shows up immediately with a recovery hint instead of at the first signature.
+pub async fn verify_stored_keys(st: &AppState) -> Res<()> {
+    let rows: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT role, public_key, private_key_enc FROM signing_keys WHERE status = 'active' ORDER BY role",
+    )
+    .fetch_all(&st.db)
+    .await?;
+    let bad: Vec<&str> = rows
+        .iter()
+        .filter(|(_, public, blob)| {
+            !crypto::open(&st.cfg.enc_key, blob)
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .is_some_and(|seed| &crypto::public_from_seed(&seed) == public)
+        })
+        .map(|(role, _, _)| role.as_str())
+        .collect();
+    if bad.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::Internal(format!(
+        "ENCRYPTION_KEY cannot decrypt the stored active signing key(s) for: {}. \
+         If the key was lost or changed, restore them from a key backup with `server key-restore` (see README)",
+        bad.join(", ")
+    )))
 }
 
 /// Active key for a stage. Fails closed if the stage's key was revoked and not yet rotated.

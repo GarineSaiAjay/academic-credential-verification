@@ -56,6 +56,35 @@ Any stage role can also reject. `university_admin` can revoke an issued credenti
   (Account page: click your email in the header), which signs out their other sessions. Passwords are 12-128 characters.
   All of this is written to the audit log; passwords never are.
 
+## Backing up and recovering the signing keys
+
+Private signing keys live in the database, encrypted under `ENCRYPTION_KEY`. **If `ENCRYPTION_KEY` is lost, they cannot be
+opened and nothing can be signed.** Credentials already issued still verify, because verification needs only public keys.
+Take a key backup once after setup and again after every key rotation or revocation. It is protected by a passphrase you
+choose, separate from `ENCRYPTION_KEY`, and holds only the active keys.
+
+```bash
+export KEY_BACKUP_PASSPHRASE='a long passphrase you will not lose'   # at least 16 characters
+umask 077
+docker compose exec -T -e KEY_BACKUP_PASSPHRASE backend ./server key-backup > acvs-keys.backup
+```
+
+Keep the file and the passphrase **apart from each other, from `.env` and from database backups**: anyone holding the file and
+the passphrase can sign as your university. To recover after losing `ENCRYPTION_KEY`:
+
+```bash
+# 1. put a NEW random ENCRYPTION_KEY in .env (openssl rand -hex 32). The old backend now refuses to start,
+#    and says why.
+# 2. re-encrypt the backed-up keys under it (add --dry-run first to preview; nothing is saved):
+docker compose run --rm -T -e KEY_BACKUP_PASSPHRASE backend ./server key-restore < acvs-keys.backup
+# 3. start normally
+docker compose up -d
+```
+
+Restore keeps the same signing keys, so existing credentials keep verifying. It also rebuilds the keys on an empty database,
+and it refuses to overwrite a key whose public half differs from the backup. `scripts/recovery-test.sh` runs this whole
+scenario (it is part of CI). This protects the keys only: you still need regular database backups (`pg_dump`) for everything else.
+
 ## Security controls
 
 | Control | Implementation |
@@ -81,7 +110,7 @@ Authenticated: `GET /auth/me`, `POST /auth/logout`, `GET|POST /credentials`, `GE
 - **The ledger is not a public blockchain.** It is a signed, hash-linked Merkle ledger in your own database. It detects tampering, but whoever controls the DB *and* the university key could rewrite history. To get public-chain guarantees, publish each block's `merkle_root` to a chain (or a timestamping service) after sealing; the data model already carries what you need.
 - Rate limiting is per process. Run more than one backend instance and you need a shared store (e.g. Redis).
 - This is not a real WAF: for internet exposure put a managed WAF/CDN and TLS in front of nginx.
-- The encryption key lives in an environment variable. For higher assurance use a KMS/HSM to wrap the signing keys.
+- The encryption key lives in an environment variable. For higher assurance use a KMS/HSM to wrap the signing keys. Losing it is recoverable only if you made a key backup (see above).
 - One signing key per stage, not per person; the audit log records which user triggered each signature.
 - No account lockout, MFA or self-service password *reset* (forgot password); an admin can reset a password for a user.
 

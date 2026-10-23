@@ -4,6 +4,7 @@ mod config;
 mod credentials;
 mod crypto;
 mod error;
+mod keybackup;
 mod keys;
 mod ledger;
 mod security;
@@ -138,11 +139,21 @@ pub fn router(st: AppState) -> Router {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| !keybackup::is_command(a)) {
+        eprintln!("{}", keybackup::USAGE);
+        std::process::exit(2);
+    }
+    let cli = !args.is_empty();
+    let logs = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+    );
+    // Commands print their result on stdout, so logs must not share it.
+    if cli {
+        logs.with_writer(std::io::stderr).init();
+    } else {
+        logs.init();
+    }
 
     let cfg = Config::from_env()?;
     let mut attempts = 0;
@@ -164,12 +175,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     sqlx::migrate!("./migrations").run(&db).await?;
 
+    // Recovery commands must work even when the server itself would refuse to start.
+    if cli {
+        return Ok(keybackup::cli(&db, &cfg.enc_key, &args).await?);
+    }
+
     let st = AppState {
         db,
         cfg: Arc::new(cfg),
         limiter: Arc::new(RateLimiter::default()),
     };
     keys::ensure_initial_keys(&st).await?;
+    keys::verify_stored_keys(&st).await?;
     users::bootstrap_admin(&st).await?;
     seed_demo_users(&st).await?;
     let (user_count,): (i64,) = sqlx::query_as("SELECT count(*) FROM users")

@@ -26,10 +26,14 @@ pub fn approval_message(credential_id: Uuid, role: &str, credential_hash: &str) 
     format!("ACVS-APPROVAL-v1|{credential_id}|{role}|{credential_hash}").into_bytes()
 }
 
+pub fn public_from_seed(seed: &[u8; 32]) -> String {
+    hex::encode(SigningKey::from_bytes(seed).verifying_key().to_bytes())
+}
+
 pub fn new_keypair() -> ([u8; 32], String) {
     let mut seed = [0u8; 32];
     OsRng.fill_bytes(&mut seed);
-    let public = hex::encode(SigningKey::from_bytes(&seed).verifying_key().to_bytes());
+    let public = public_from_seed(&seed);
     (seed, public)
 }
 

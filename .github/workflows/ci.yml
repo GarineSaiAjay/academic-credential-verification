@@ -36,5 +36,7 @@ jobs:
       - run: ./scripts/gen-env.sh
       - run: docker compose up -d --build --wait
       - run: ./scripts/smoke.sh http://localhost:3000
+      - run: docker compose down -v
+      - run: ./scripts/recovery-test.sh
       - if: failure()
         run: docker compose logs
