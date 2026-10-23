@@ -53,6 +53,88 @@ pub struct ApprovalRow {
     pub key_status: String,
 }
 
+/// A signed rejection or revocation, with the key that signed it.
+#[derive(FromRow)]
+pub struct EventRow {
+    pub kind: String,
+    pub stage: String,
+    pub reason: String,
+    pub ts: i64,
+    pub legacy: bool,
+    pub created_at: DateTime<Utc>,
+    pub signature: String,
+    pub key_id: Uuid,
+    pub public_key: String,
+    pub key_status: String,
+}
+
+pub struct Termination {
+    pub row: EventRow,
+    /// Right stage for the kind, signature verifies, and the signing key has not been revoked.
+    pub valid: bool,
+}
+
+impl EventRow {
+    fn evaluate(self, c: &CredRow) -> Termination {
+        let stage_ok = match self.kind.as_str() {
+            "revoked" => self.stage == "university",
+            "rejected" => matches!(
+                self.stage.as_str(),
+                "exam_cell" | "registrar" | "university"
+            ),
+            _ => false,
+        };
+        let valid = stage_ok
+            && self.key_status != "revoked"
+            && crypto::verify(
+                &self.public_key,
+                &self.signature,
+                &crypto::event_message(
+                    c.id,
+                    &self.kind,
+                    &self.stage,
+                    &c.credential_hash,
+                    &self.reason,
+                    self.ts,
+                    self.legacy,
+                ),
+            );
+        Termination { row: self, valid }
+    }
+
+    fn view(&self, valid: bool) -> Value {
+        json!({
+            "kind": self.kind, "stage": self.stage, "reason": self.reason, "at": self.created_at,
+            "legacy": self.legacy, "valid": valid, "key_id": self.key_id,
+        })
+    }
+}
+
+async fn fetch_event<'e>(
+    e: impl PgExecutor<'e>,
+    id: Uuid,
+    c: &CredRow,
+) -> Res<Option<Termination>> {
+    let row: Option<EventRow> = sqlx::query_as(
+        "SELECT ev.kind, ev.stage, ev.reason, ev.ts, ev.legacy, ev.created_at, ev.signature, ev.key_id,
+                k.public_key, k.status AS key_status
+         FROM credential_events ev JOIN signing_keys k ON k.id = ev.key_id WHERE ev.credential_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(e)
+    .await?;
+    Ok(row.map(|r| r.evaluate(c)))
+}
+
+/// The status column must agree with the signed event: a final status needs a valid event of that kind,
+/// and an event needs the matching status. Anything else means the column or the event was tampered with.
+pub fn termination_ok(c: &CredRow, t: Option<&Termination>) -> bool {
+    match t {
+        None => !matches!(c.status.as_str(), "revoked" | "rejected"),
+        Some(t) => t.valid && t.row.kind == c.status,
+    }
+}
+
 impl CredRow {
     /// Recomputes the content hash from the stored fields (detects any database tampering).
     pub fn recompute_hash(&self) -> String {
@@ -151,12 +233,17 @@ pub fn evaluate(c: &CredRow, rows: &[ApprovalRow]) -> Evaluation {
     }
 }
 
-pub fn verdict(c: &CredRow, ev: &Evaluation) -> &'static str {
-    match c.status.as_str() {
-        "revoked" => "REVOKED",
+/// A signed event decides the outcome, whatever the mutable status column says. A final status with no
+/// valid event behind it is treated as tampering.
+pub fn verdict(c: &CredRow, ev: &Evaluation, t: Option<&Termination>) -> &'static str {
+    match (c.status.as_str(), t) {
+        (_, Some(t)) if !t.valid => "INVALID",
+        (_, Some(t)) if t.row.kind == "revoked" => "REVOKED",
+        (_, Some(_)) if ev.hash_ok && ev.order_ok && ev.sigs_ok() => "REJECTED",
+        (_, Some(_)) => "INVALID",
+        ("revoked" | "rejected", None) => "INVALID",
         _ if !ev.intact() => "INVALID",
-        "issued" => "VALID",
-        "rejected" => "REJECTED",
+        ("issued", None) => "VALID",
         _ => "PENDING",
     }
 }
@@ -277,15 +364,16 @@ async fn load(st: &AppState, user: &AuthUser, id: Uuid) -> Res<CredRow> {
     Ok(c)
 }
 
-fn full_view(c: &CredRow, ev: &Evaluation) -> Value {
+fn full_view(c: &CredRow, ev: &Evaluation, t: Option<&Termination>) -> Value {
     json!({
         "id": c.id, "student_id": c.student_id, "student_name": c.student_name, "program": c.program,
         "graduation_date": c.graduation_date, "gpa": c.gpa, "honors": c.honors,
         "credential_hash": c.credential_hash, "status": c.status, "created_at": c.created_at,
         "revoked_at": c.revoked_at, "revoke_reason": c.revoke_reason,
         "block_height": c.block_height, "leaf_index": c.leaf_index,
-        "verdict": verdict(c, ev), "signatures": ev.sigs,
-        "checks": { "hash_ok": ev.hash_ok, "order_ok": ev.order_ok, "status_ok": ev.status_ok, "signatures_ok": ev.sigs_ok() },
+        "verdict": verdict(c, ev, t), "signatures": ev.sigs,
+        "termination": t.map(|t| t.row.view(t.valid)),
+        "checks": { "hash_ok": ev.hash_ok, "order_ok": ev.order_ok, "status_ok": ev.status_ok, "signatures_ok": ev.sigs_ok(), "termination_ok": termination_ok(c, t) },
     })
 }
 
@@ -296,7 +384,8 @@ pub async fn get(
 ) -> Res<Json<Value>> {
     let c = load(&st, &user, id).await?;
     let ev = evaluate(&c, &fetch_approvals(&st.db, id).await?);
-    Ok(Json(full_view(&c, &ev)))
+    let t = fetch_event(&st.db, id, &c).await?;
+    Ok(Json(full_view(&c, &ev, t.as_ref())))
 }
 
 /// (stage that must sign next, status after signing)
@@ -318,6 +407,52 @@ async fn lock(tx: &mut sqlx::PgConnection, id: Uuid) -> Res<CredRow> {
     .await?)
 }
 
+/// A credential that already has a signed rejection or revocation can never be acted on again.
+async fn ensure_open(tx: &mut sqlx::PgConnection, id: Uuid) -> Res<()> {
+    let ended: Option<(String,)> =
+        sqlx::query_as("SELECT kind FROM credential_events WHERE credential_id = $1")
+            .bind(id)
+            .fetch_optional(tx)
+            .await?;
+    match ended {
+        None => Ok(()),
+        Some((kind,)) => Err(AppError::Conflict(format!("credential is already {kind}"))),
+    }
+}
+
+/// Signs a rejection or revocation with the stage's key and stores it, in the caller's transaction.
+async fn record_event(
+    st: &AppState,
+    tx: &mut sqlx::PgConnection,
+    c: &CredRow,
+    kind: &str,
+    stage: &str,
+    reason: &str,
+    actor: Uuid,
+) -> Res<()> {
+    let (key_id, seed) = keys::active_signer(st, stage).await?;
+    let ts = Utc::now().timestamp();
+    let signature = crypto::sign(
+        &seed,
+        &crypto::event_message(c.id, kind, stage, &c.credential_hash, reason, ts, false),
+    );
+    sqlx::query(
+        "INSERT INTO credential_events (credential_id, kind, stage, reason, actor_id, key_id, signature, ts)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+    )
+    .bind(c.id)
+    .bind(kind)
+    .bind(stage)
+    .bind(reason)
+    .bind(actor)
+    .bind(key_id)
+    .bind(signature)
+    .bind(ts)
+    .execute(tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn approve(
     State(st): State<AppState>,
     user: AuthUser,
@@ -332,6 +467,7 @@ pub async fn approve(
         ))
     })?;
 
+    ensure_open(&mut tx, id).await?;
     let prior = fetch_approvals(&mut *tx, id).await?;
     if !evaluate(&c, &prior).intact() {
         return Err(AppError::Conflict(
@@ -383,17 +519,19 @@ pub async fn reject(
     let reason = reason(&b)?;
     let mut tx = st.db.begin().await?;
     let c = lock(&mut tx, id).await?;
-    next_stage(&c.status, user.role).ok_or_else(|| {
+    let (stage, _) = next_stage(&c.status, user.role).ok_or_else(|| {
         AppError::Conflict(format!(
             "credential is '{}'; your role cannot reject it now",
             c.status
         ))
     })?;
+    ensure_open(&mut tx, id).await?;
     sqlx::query("UPDATE credentials SET status = 'rejected', revoke_reason = $2 WHERE id = $1")
         .bind(id)
         .bind(&reason)
         .execute(&mut *tx)
         .await?;
+    record_event(&st, &mut tx, &c, "rejected", stage, &reason, user.id).await?;
     tx.commit().await?;
     audit::actor_log(
         &st.db,
@@ -415,13 +553,21 @@ pub async fn revoke(
 ) -> Res<Json<Value>> {
     user.require(&[Role::UniversityAdmin])?;
     let reason = reason(&b)?;
-    let n = sqlx::query("UPDATE credentials SET status = 'revoked', revoked_at = now(), revoke_reason = $2 WHERE id = $1 AND status = 'issued'")
-        .bind(id).bind(&reason).execute(&st.db).await?.rows_affected();
-    if n == 0 {
+    let mut tx = st.db.begin().await?;
+    let c = lock(&mut tx, id).await?;
+    if c.status != "issued" {
         return Err(AppError::Conflict(
             "only issued credentials can be revoked".into(),
         ));
     }
+    ensure_open(&mut tx, id).await?;
+    sqlx::query("UPDATE credentials SET status = 'revoked', revoked_at = now(), revoke_reason = $2 WHERE id = $1")
+        .bind(id)
+        .bind(&reason)
+        .execute(&mut *tx)
+        .await?;
+    record_event(&st, &mut tx, &c, "revoked", "university", &reason, user.id).await?;
+    tx.commit().await?;
     audit::actor_log(
         &st.db,
         &user,
@@ -432,6 +578,77 @@ pub async fn revoke(
     )
     .await;
     Ok(Json(json!({ "id": id, "status": "revoked" })))
+}
+
+/// Signs events for credentials that were rejected or revoked before events existed (or whose event was
+/// lost), so they keep their verdict instead of reading as tampered. Safe to run on every start.
+pub async fn backfill_events(st: &AppState) -> Res<()> {
+    type Orphan = (
+        Uuid,
+        String,
+        String,
+        Option<DateTime<Utc>>,
+        Option<String>,
+        i64,
+    );
+    let rows: Vec<Orphan> = sqlx::query_as(
+        "SELECT c.id, c.credential_hash, c.status, c.revoked_at, c.revoke_reason,
+                (SELECT count(*) FROM approvals a WHERE a.credential_id = c.id)
+         FROM credentials c
+         WHERE c.status IN ('revoked','rejected')
+           AND NOT EXISTS (SELECT 1 FROM credential_events e WHERE e.credential_id = c.id)",
+    )
+    .fetch_all(&st.db)
+    .await?;
+    for (id, hash, status, revoked_at, why, approvals) in rows {
+        // A rejection happened at the first stage that had not signed yet.
+        let stage = match (status.as_str(), STAGES.get(approvals as usize)) {
+            ("revoked", _) => "university",
+            (_, Some(stage)) if *stage != "faculty" => stage,
+            _ => continue,
+        };
+        let reason = why.unwrap_or_else(|| "(no reason recorded)".into());
+        let ts = revoked_at.unwrap_or_else(Utc::now).timestamp();
+        let (key_id, seed) = match keys::active_signer(st, stage).await {
+            Ok(k) => k,
+            Err(_) => {
+                tracing::warn!(%id, stage, "cannot sign a missing credential event: no usable '{stage}' key");
+                continue;
+            }
+        };
+        let signature = crypto::sign(
+            &seed,
+            &crypto::event_message(id, &status, stage, &hash, &reason, ts, true),
+        );
+        let inserted = sqlx::query(
+            "INSERT INTO credential_events (credential_id, kind, stage, reason, key_id, signature, ts, legacy)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,true) ON CONFLICT DO NOTHING",
+        )
+        .bind(id)
+        .bind(&status)
+        .bind(stage)
+        .bind(&reason)
+        .bind(key_id)
+        .bind(signature)
+        .bind(ts)
+        .execute(&st.db)
+        .await?
+        .rows_affected();
+        if inserted == 1 {
+            audit::log(
+                &st.db,
+                None,
+                None,
+                "EVENT_BACKFILLED",
+                Some("credential"),
+                Some(&id.to_string()),
+                json!({ "kind": status, "stage": stage }),
+            )
+            .await;
+            tracing::warn!(%id, kind = %status, "signed a missing credential event");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -452,12 +669,13 @@ pub async fn verify(
     .fetch_one(&st.db)
     .await?;
     let ev = evaluate(&c, &fetch_approvals(&st.db, id).await?);
+    let t = fetch_event(&st.db, id, &c).await?;
     let anchor = crate::ledger::anchor_for(&st.db, &c).await?;
     let qr_match =
         q.h.as_deref()
             .filter(|h| h.len() >= 8)
             .map(|h| c.credential_hash.starts_with(&h.to_lowercase()));
-    let mut verdict = verdict(&c, &ev);
+    let mut verdict = verdict(&c, &ev, t.as_ref());
     if verdict == "VALID" && anchor.as_ref().is_some_and(|a| !a.ok) {
         verdict = "INVALID";
     }
@@ -466,9 +684,12 @@ pub async fn verify(
         "credential": {
             "id": c.id, "student_name": c.student_name, "program": c.program, "graduation_date": c.graduation_date,
             "gpa": c.gpa, "honors": c.honors, "status": c.status, "credential_hash": c.credential_hash,
-            "revoked_at": c.revoked_at, "revoke_reason": c.revoke_reason,
+            // Shown from the signed event when there is one, not from the editable columns.
+            "revoked_at": t.as_ref().filter(|t| t.row.kind == "revoked").map(|t| t.row.created_at),
+            "revoke_reason": t.as_ref().map(|t| t.row.reason.as_str()),
         },
-        "checks": { "hash_ok": ev.hash_ok, "order_ok": ev.order_ok, "status_ok": ev.status_ok, "signatures_ok": ev.sigs_ok() },
+        "termination": t.as_ref().map(|t| t.row.view(t.valid)),
+        "checks": { "hash_ok": ev.hash_ok, "order_ok": ev.order_ok, "status_ok": ev.status_ok, "signatures_ok": ev.sigs_ok(), "termination_ok": termination_ok(&c, t.as_ref()) },
         "signatures": ev.sigs,
         "anchor": anchor,
         "qr_hash_match": qr_match,
@@ -498,4 +719,212 @@ pub async fn qr(State(st): State<AppState>, Path(id): Path<Uuid>) -> Res<impl In
         ],
         png,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cred(status: &str) -> CredRow {
+        CredRow {
+            id: Uuid::nil(),
+            student_id: "S".into(),
+            student_name: "Ada".into(),
+            program: "BSc".into(),
+            graduation_date: NaiveDate::from_ymd_opt(2025, 5, 15).unwrap(),
+            gpa: None,
+            honors: None,
+            credential_hash: "ab".repeat(32),
+            status: status.into(),
+            created_by: Uuid::nil(),
+            created_at: Utc::now(),
+            revoked_at: None,
+            revoke_reason: None,
+            block_height: None,
+            leaf_index: None,
+        }
+    }
+
+    fn ev(intact: bool) -> Evaluation {
+        Evaluation {
+            hash_ok: intact,
+            order_ok: true,
+            status_ok: true,
+            sigs: vec![],
+        }
+    }
+
+    fn event(kind: &str, stage: &str, seed: &[u8; 32], reason: &str, key_status: &str) -> EventRow {
+        let c = cred(kind);
+        let ts = 1_700_000_000;
+        EventRow {
+            kind: kind.into(),
+            stage: stage.into(),
+            reason: reason.into(),
+            ts,
+            legacy: false,
+            created_at: Utc::now(),
+            signature: crypto::sign(
+                seed,
+                &crypto::event_message(c.id, kind, stage, &c.credential_hash, reason, ts, false),
+            ),
+            key_id: Uuid::nil(),
+            public_key: crypto::public_from_seed(seed),
+            key_status: key_status.into(),
+        }
+    }
+
+    #[test]
+    fn a_genuine_event_is_valid_and_tampering_breaks_it() {
+        let (seed, _) = crypto::new_keypair();
+        let c = cred("revoked");
+        assert!(
+            event("revoked", "university", &seed, "error", "active")
+                .evaluate(&c)
+                .valid
+        );
+
+        let mut edited = event("revoked", "university", &seed, "error", "active");
+        edited.reason = "a different reason".into();
+        assert!(!edited.evaluate(&c).valid, "reason is signed");
+
+        let mut later = event("revoked", "university", &seed, "error", "active");
+        later.ts += 1;
+        assert!(!later.evaluate(&c).valid, "time is signed");
+
+        let mut other_card = cred("revoked");
+        other_card.credential_hash = "cd".repeat(32);
+        assert!(
+            !event("revoked", "university", &seed, "error", "active")
+                .evaluate(&other_card)
+                .valid,
+            "bound to the credential's content hash"
+        );
+
+        let (other_seed, _) = crypto::new_keypair();
+        let mut forged = event("revoked", "university", &other_seed, "error", "active");
+        forged.public_key = crypto::public_from_seed(&seed);
+        assert!(!forged.evaluate(&c).valid, "signed by someone else");
+    }
+
+    #[test]
+    fn stage_must_fit_the_kind_and_the_key_must_be_trusted() {
+        let (seed, _) = crypto::new_keypair();
+        assert!(
+            !event("revoked", "registrar", &seed, "r", "active")
+                .evaluate(&cred("revoked"))
+                .valid
+        );
+        assert!(
+            !event("rejected", "faculty", &seed, "r", "active")
+                .evaluate(&cred("rejected"))
+                .valid
+        );
+        assert!(
+            event("rejected", "registrar", &seed, "r", "active")
+                .evaluate(&cred("rejected"))
+                .valid
+        );
+        assert!(
+            !event("revoked", "university", &seed, "r", "revoked")
+                .evaluate(&cred("revoked"))
+                .valid
+        );
+        assert!(
+            event("revoked", "university", &seed, "r", "retired")
+                .evaluate(&cred("revoked"))
+                .valid
+        );
+    }
+
+    #[test]
+    fn verdicts_follow_the_signed_event_not_the_status_column() {
+        let (seed, _) = crypto::new_keypair();
+        let good = |kind: &str, stage: &str| {
+            let c = cred(kind);
+            event(kind, stage, &seed, "why", "active").evaluate(&c)
+        };
+        let bad = |kind: &str| {
+            let mut t = good(kind, "university");
+            t.valid = false;
+            t
+        };
+        // (status column, event, content intact) -> verdict
+        let table: Vec<(&str, Option<Termination>, bool, &str)> = vec![
+            ("issued", None, true, "VALID"),
+            ("issued", None, false, "INVALID"),
+            ("pending_registrar", None, true, "PENDING"),
+            (
+                "revoked",
+                Some(good("revoked", "university")),
+                true,
+                "REVOKED",
+            ),
+            (
+                "revoked",
+                Some(good("revoked", "university")),
+                false,
+                "REVOKED",
+            ),
+            // someone set the column back to "issued" but could not remove the signed revocation
+            (
+                "issued",
+                Some(good("revoked", "university")),
+                true,
+                "REVOKED",
+            ),
+            // revoked/rejected written into the column with no signed event behind it
+            ("revoked", None, true, "INVALID"),
+            ("rejected", None, true, "INVALID"),
+            ("revoked", Some(bad("revoked")), true, "INVALID"),
+            (
+                "rejected",
+                Some(good("rejected", "registrar")),
+                true,
+                "REJECTED",
+            ),
+            (
+                "rejected",
+                Some(good("rejected", "registrar")),
+                false,
+                "INVALID",
+            ),
+            (
+                "pending_registrar",
+                Some(good("rejected", "registrar")),
+                true,
+                "REJECTED",
+            ),
+        ];
+        for (status, t, intact, want) in table {
+            let c = cred(status);
+            assert_eq!(
+                verdict(&c, &ev(intact), t.as_ref()),
+                want,
+                "{status} intact={intact}"
+            );
+        }
+    }
+
+    #[test]
+    fn termination_consistency() {
+        let (seed, _) = crypto::new_keypair();
+        let t = |kind: &str, stage: &str| {
+            event(kind, stage, &seed, "r", "active").evaluate(&cred(kind))
+        };
+        assert!(termination_ok(&cred("issued"), None));
+        assert!(termination_ok(
+            &cred("revoked"),
+            Some(&t("revoked", "university"))
+        ));
+        assert!(!termination_ok(&cred("revoked"), None));
+        assert!(!termination_ok(
+            &cred("issued"),
+            Some(&t("revoked", "university"))
+        ));
+        assert!(!termination_ok(
+            &cred("rejected"),
+            Some(&t("revoked", "university"))
+        ));
+    }
 }

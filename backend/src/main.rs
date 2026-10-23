@@ -204,6 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     keys::ensure_initial_keys(&st).await?;
     keys::verify_stored_keys(&st).await?;
+    credentials::backfill_events(&st).await?;
     users::bootstrap_admin(&st).await?;
     seed_demo_users(&st).await?;
     let (user_count,): (i64,) = sqlx::query_as("SELECT count(*) FROM users")

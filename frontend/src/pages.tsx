@@ -169,6 +169,7 @@ export function CredDetail({ id, role }: { id: string; role: Role }) {
               <tr><th>Content hash</th><td className="mono">{c.credential_hash}</td></tr>
               <tr><th>Anchored</th><td>{c.block_height ? `block #${c.block_height}, leaf ${c.leaf_index}` : 'not yet'}</td></tr>
               {c.revoke_reason && <tr><th>Reason</th><td>{c.revoke_reason}</td></tr>}
+              {c.termination && <tr><th>Signed {c.termination.kind}</th><td className={c.termination.valid ? 'good' : 'bad'}>{c.termination.valid ? `signature valid (${c.termination.stage.replace('_', ' ')} key${c.termination.legacy ? ', added later for an older record' : ''})` : 'SIGNATURE INVALID'}</td></tr>}
             </tbody></table>
             <div className="toolbar">
               {canSign && <button onClick={() => run(() => api('POST', `/credentials/${id}/approve`), 'Signed', reload)}>Sign as {role.replace('_', ' ')}</button>}
@@ -213,6 +214,7 @@ export function Verify({ id, h }: { id?: string; h?: string }) {
               <tr><th>GPA / Honors</th><td>{v.credential.gpa ?? '-'} / {v.credential.honors ?? '-'}</td></tr>
               <tr><th>Content hash</th><td className="mono">{v.credential.credential_hash}</td></tr>
               {v.credential.revoke_reason && <tr><th>Reason</th><td>{v.credential.revoke_reason}</td></tr>}
+              {v.termination && <tr><th>Signed {v.termination.kind}</th><td className={v.termination.valid ? 'good' : 'bad'}>{v.termination.valid ? `signature valid (${v.termination.stage.replace('_', ' ')} key${v.termination.legacy ? ', added later for an older record' : ''})` : 'SIGNATURE INVALID'}</td></tr>}
             </tbody></table>
           </Card>
           <Card title="Checks">

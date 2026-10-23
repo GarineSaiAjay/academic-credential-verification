@@ -100,6 +100,55 @@ call GET /verify/$ID2; expect "rejected verdict" "$(echo "$BODY" | j "d['verdict
 call POST /credentials/$ID/revoke "$ADM" '{"reason":"issued in error"}'; check "admin revokes issued" 200
 call GET /verify/$ID; expect "revoked verdict" "$(echo "$BODY" | j "d['verdict']")" REVOKED
 
+echo "== signed rejection and revocation"
+yes() { if [[ "$2" == "$3" ]]; then echo "  ok   $1"; else echo "  FAIL $1: expected '$3' got '$2'"; fails=$((fails+1)); fi; }
+TERM_OF() { echo "$BODY" | j "str(d['termination']['kind'])+':'+str(d['termination']['stage'])+':'+str(d['termination']['valid'])"; }
+call GET /verify/$ID; yes "revocation is a signed event" "$(TERM_OF)" "revoked:university:True"
+yes "reason is read from the signed event" "$(echo "$BODY" | j "d['credential']['revoke_reason']")" "issued in error"
+yes "termination check passes" "$(echo "$BODY" | j "d['checks']['termination_ok']")" True
+call GET /verify/$ID2; yes "rejection is a signed event" "$(TERM_OF)" "rejected:university:True"
+yes "rejected verdict comes from the event" "$(echo "$BODY" | j "d['verdict']")" REJECTED
+call POST /credentials/$ID/revoke "$ADM" '{"reason":"again"}'; check "cannot revoke twice" 409
+call POST /credentials/$ID2/approve "$ADM"; check "cannot sign a rejected credential" 409
+R=$(DBX "UPDATE credentials SET status='issued' WHERE id='$ID'"); [[ "$R" == *"status is final"* ]] && echo "  ok   a revoked status cannot be changed back by SQL" || { echo "  FAIL status editable: $R"; fails=$((fails+1)); }
+R=$(DBX "DELETE FROM credential_events WHERE credential_id='$ID'"); [[ "$R" == *"append-only"* ]] && echo "  ok   events cannot be deleted" || { echo "  FAIL event deletable: $R"; fails=$((fails+1)); }
+
+# Attacks by someone who can switch the database triggers off.
+NOFINAL="ALTER TABLE credentials DISABLE TRIGGER credentials_final_status;"; FINAL="ALTER TABLE credentials ENABLE TRIGGER credentials_final_status;"
+NOEV="ALTER TABLE credential_events DISABLE TRIGGER credential_events_append_only;"; EV="ALTER TABLE credential_events ENABLE TRIGGER credential_events_append_only;"
+DBX "$NOFINAL UPDATE credentials SET status='issued' WHERE id='$ID'; $FINAL" >/dev/null
+call GET /verify/$ID; yes "un-revoking the status column does not revive the credential" "$(echo "$BODY" | j "d['verdict']")" REVOKED
+yes "and the edit is flagged" "$(echo "$BODY" | j "d['checks']['termination_ok']")" False
+DBX "UPDATE credentials SET status='revoked' WHERE id='$ID'" >/dev/null
+call GET /verify/$ID; yes "status restored, checks pass again" "$(echo "$BODY" | j "d['checks']['termination_ok']")" True
+
+call POST /credentials "$FAC" "$BODY_C"; ID3=$(echo "$BODY" | j "d['id']")
+for t in "$EXC" "$REG" "$ADM"; do call POST /credentials/$ID3/approve "$t"; done
+call GET /verify/$ID3; yes "a fresh issued credential is VALID" "$(echo "$BODY" | j "d['verdict']")" VALID
+DBX "UPDATE credentials SET status='revoked', revoked_at=now(), revoke_reason='forged' WHERE id='$ID3'" >/dev/null
+call GET /verify/$ID3; yes "a revoked status with no signed event is INVALID, not trusted" "$(echo "$BODY" | j "d['verdict']")" INVALID
+yes "and is flagged" "$(echo "$BODY" | j "d['checks']['termination_ok']")" False
+DBX "$NOFINAL UPDATE credentials SET status='issued', revoked_at=NULL, revoke_reason=NULL WHERE id='$ID3'; $FINAL" >/dev/null
+call GET /verify/$ID3; yes "restored to VALID" "$(echo "$BODY" | j "d['verdict']")" VALID
+
+DBX "$NOEV UPDATE credential_events SET reason='forged reason' WHERE credential_id='$ID'; $EV" >/dev/null
+call GET /verify/$ID; yes "an edited revocation reason breaks its signature" "$(echo "$BODY" | j "d['verdict']")" INVALID
+yes "and the event is reported invalid" "$(echo "$BODY" | j "d['termination']['valid']")" False
+DBX "$NOEV UPDATE credential_events SET reason='issued in error' WHERE credential_id='$ID'; $EV" >/dev/null
+call GET /verify/$ID; yes "reason restored, REVOKED again" "$(echo "$BODY" | j "d['verdict']")" REVOKED
+
+DBX "$NOFINAL UPDATE credentials SET status='pending_university' WHERE id='$ID2'; $FINAL" >/dev/null
+call GET /verify/$ID2; yes "a rejected credential stays REJECTED when its status is reset" "$(echo "$BODY" | j "d['verdict']")" REJECTED
+call POST /credentials/$ID2/approve "$ADM"; check "and cannot be signed while its status is reset" 409
+DBX "UPDATE credentials SET status='rejected' WHERE id='$ID2'" >/dev/null
+
+DBX "$NOEV DELETE FROM credential_events WHERE credential_id='$ID'; $EV" >/dev/null
+call GET /verify/$ID; yes "a revoked status whose event was deleted reads as INVALID" "$(echo "$BODY" | j "d['verdict']")" INVALID
+docker compose restart backend >/dev/null 2>&1; docker compose up -d --wait >/dev/null 2>&1
+call GET /verify/$ID; yes "a restart re-signs the missing event: REVOKED again" "$(echo "$BODY" | j "d['verdict']")" REVOKED
+yes "marked as added later" "$(echo "$BODY" | j "d['termination']['legacy']")" True
+yes "with a valid signature" "$(echo "$BODY" | j "d['termination']['valid']")" True
+
 echo "== user management"
 # Budget: the login limiter allows 10/min per IP and 6 logins are already used, so this section makes 4.
 UEMAIL="smoke-$RANDOM$RANDOM@university.edu"; P1="smoke-pass-one-1"; P2="smoke-pass-two-2"; P3="smoke-pass-three-3"

@@ -26,6 +26,25 @@ pub fn approval_message(credential_id: Uuid, role: &str, credential_hash: &str) 
     format!("ACVS-APPROVAL-v1|{credential_id}|{role}|{credential_hash}").into_bytes()
 }
 
+/// Bytes signed for a rejection or revocation; binds it to the credential, its content hash, the reason
+/// and the time, so none of them can be altered without breaking the signature.
+pub fn event_message(
+    credential_id: Uuid,
+    kind: &str,
+    stage: &str,
+    credential_hash: &str,
+    reason: &str,
+    ts: i64,
+    legacy: bool,
+) -> Vec<u8> {
+    format!(
+        "ACVS-EVENT-v1|{credential_id}|{kind}|{stage}|{credential_hash}|{}|{ts}|{}",
+        sha256_hex(reason.as_bytes()),
+        u8::from(legacy)
+    )
+    .into_bytes()
+}
+
 pub fn public_from_seed(seed: &[u8; 32]) -> String {
     hex::encode(SigningKey::from_bytes(seed).verifying_key().to_bytes())
 }
