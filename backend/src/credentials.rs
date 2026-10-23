@@ -39,9 +39,11 @@ pub struct CredRow {
     pub revoke_reason: Option<String>,
     pub block_height: Option<i64>,
     pub leaf_index: Option<i32>,
+    /// The credential this one replaces (part of the signed content hash).
+    pub supersedes: Option<Uuid>,
 }
 
-const CRED_COLS: &str = "id, student_id, student_name, program, graduation_date, gpa, honors, credential_hash, status, created_by, created_at, revoked_at, revoke_reason, block_height, leaf_index";
+const CRED_COLS: &str = "id, student_id, student_name, program, graduation_date, gpa, honors, credential_hash, status, created_by, created_at, revoked_at, revoke_reason, block_height, leaf_index, supersedes";
 
 #[derive(FromRow)]
 pub struct ApprovalRow {
@@ -135,34 +137,52 @@ pub fn termination_ok(c: &CredRow, t: Option<&Termination>) -> bool {
     }
 }
 
-impl CredRow {
-    /// Recomputes the content hash from the stored fields (detects any database tampering).
-    pub fn recompute_hash(&self) -> String {
-        content_hash(
-            self.id,
-            &self.student_id,
-            &self.student_name,
-            &self.program,
-            self.graduation_date,
-            self.gpa.as_deref(),
-            self.honors.as_deref(),
-        )
+/// Everything the content hash covers. Credentials that replace another use hash version 2, which also
+/// covers the id of the credential they replace; ordinary ones keep the original version-1 hash.
+pub struct Content<'a> {
+    pub id: Uuid,
+    pub student_id: &'a str,
+    pub student_name: &'a str,
+    pub program: &'a str,
+    pub graduation_date: NaiveDate,
+    pub gpa: Option<&'a str>,
+    pub honors: Option<&'a str>,
+    pub supersedes: Option<Uuid>,
+}
+
+impl Content<'_> {
+    pub fn hash(&self) -> String {
+        let mut v = json!({
+            "v": 1, "id": self.id.to_string(), "student_id": self.student_id, "student_name": self.student_name,
+            "program": self.program, "graduation_date": self.graduation_date.to_string(),
+            "gpa": self.gpa, "honors": self.honors,
+        });
+        if let Some(old) = self.supersedes {
+            v["v"] = 2.into();
+            v["supersedes"] = old.to_string().into();
+        }
+        crypto::canonical_hash(&v)
     }
 }
 
-fn content_hash(
-    id: Uuid,
-    student_id: &str,
-    name: &str,
-    program: &str,
-    date: NaiveDate,
-    gpa: Option<&str>,
-    honors: Option<&str>,
-) -> String {
-    crypto::canonical_hash(&json!({
-        "v": 1, "id": id.to_string(), "student_id": student_id, "student_name": name,
-        "program": program, "graduation_date": date.to_string(), "gpa": gpa, "honors": honors,
-    }))
+impl CredRow {
+    fn content(&self) -> Content<'_> {
+        Content {
+            id: self.id,
+            student_id: &self.student_id,
+            student_name: &self.student_name,
+            program: &self.program,
+            graduation_date: self.graduation_date,
+            gpa: self.gpa.as_deref(),
+            honors: self.honors.as_deref(),
+            supersedes: self.supersedes,
+        }
+    }
+
+    /// Recomputes the content hash from the stored fields (detects any database tampering).
+    pub fn recompute_hash(&self) -> String {
+        self.content().hash()
+    }
 }
 
 async fn fetch_approvals<'e>(e: impl PgExecutor<'e>, id: Uuid) -> Res<Vec<ApprovalRow>> {
@@ -274,42 +294,71 @@ fn clean_opt(field: &str, v: Option<String>, max: usize) -> Res<Option<String>> 
         .transpose()
 }
 
+/// Validated credential fields.
+struct Fields {
+    student_id: String,
+    student_name: String,
+    program: String,
+    graduation_date: NaiveDate,
+    gpa: Option<String>,
+    honors: Option<String>,
+}
+
+fn parse_fields(b: CreateBody) -> Res<Fields> {
+    Ok(Fields {
+        student_id: clean("student_id", &b.student_id, 64)?,
+        student_name: clean("student_name", &b.student_name, 200)?,
+        program: clean("program", &b.program, 200)?,
+        gpa: clean_opt("gpa", b.gpa, 10)?,
+        honors: clean_opt("honors", b.honors, 100)?,
+        graduation_date: NaiveDate::parse_from_str(b.graduation_date.trim(), "%Y-%m-%d")
+            .map_err(|_| AppError::BadRequest("graduation_date must be YYYY-MM-DD".into()))?,
+    })
+}
+
+/// Inserts a credential with the faculty stage's signature, in the caller's transaction.
+/// Returns its id and content hash.
+async fn insert_credential(
+    st: &AppState,
+    tx: &mut sqlx::PgConnection,
+    user: &AuthUser,
+    f: &Fields,
+    supersedes: Option<Uuid>,
+) -> Res<(Uuid, String)> {
+    let id = Uuid::new_v4();
+    let hash = Content {
+        id,
+        student_id: &f.student_id,
+        student_name: &f.student_name,
+        program: &f.program,
+        graduation_date: f.graduation_date,
+        gpa: f.gpa.as_deref(),
+        honors: f.honors.as_deref(),
+        supersedes,
+    }
+    .hash();
+    let (key_id, seed) = keys::active_signer(st, "faculty").await?;
+    let signature = crypto::sign(&seed, &crypto::approval_message(id, "faculty", &hash));
+    sqlx::query(
+        "INSERT INTO credentials (id, student_id, student_name, program, graduation_date, gpa, honors, credential_hash, status, created_by, supersedes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending_exam_cell',$9,$10)",
+    ).bind(id).bind(&f.student_id).bind(&f.student_name).bind(&f.program).bind(f.graduation_date).bind(&f.gpa).bind(&f.honors).bind(&hash).bind(user.id).bind(supersedes)
+    .execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO approvals (id, credential_id, role, approver_id, key_id, signature) VALUES ($1,$2,'faculty',$3,$4,$5)")
+        .bind(Uuid::new_v4()).bind(id).bind(user.id).bind(key_id).bind(&signature)
+        .execute(tx).await?;
+    Ok((id, hash))
+}
+
 pub async fn create(
     State(st): State<AppState>,
     user: AuthUser,
     Json(b): Json<CreateBody>,
 ) -> Res<(StatusCode, Json<Value>)> {
     user.require(&[Role::Faculty])?;
-    let student_id = clean("student_id", &b.student_id, 64)?;
-    let name = clean("student_name", &b.student_name, 200)?;
-    let program = clean("program", &b.program, 200)?;
-    let gpa = clean_opt("gpa", b.gpa, 10)?;
-    let honors = clean_opt("honors", b.honors, 100)?;
-    let date = NaiveDate::parse_from_str(b.graduation_date.trim(), "%Y-%m-%d")
-        .map_err(|_| AppError::BadRequest("graduation_date must be YYYY-MM-DD".into()))?;
-
-    let id = Uuid::new_v4();
-    let hash = content_hash(
-        id,
-        &student_id,
-        &name,
-        &program,
-        date,
-        gpa.as_deref(),
-        honors.as_deref(),
-    );
-    let (key_id, seed) = keys::active_signer(&st, "faculty").await?;
-    let signature = crypto::sign(&seed, &crypto::approval_message(id, "faculty", &hash));
-
+    let fields = parse_fields(b)?;
     let mut tx = st.db.begin().await?;
-    sqlx::query(
-        "INSERT INTO credentials (id, student_id, student_name, program, graduation_date, gpa, honors, credential_hash, status, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending_exam_cell',$9)",
-    ).bind(id).bind(&student_id).bind(&name).bind(&program).bind(date).bind(&gpa).bind(&honors).bind(&hash).bind(user.id)
-    .execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO approvals (id, credential_id, role, approver_id, key_id, signature) VALUES ($1,$2,'faculty',$3,$4,$5)")
-        .bind(Uuid::new_v4()).bind(id).bind(user.id).bind(key_id).bind(&signature)
-        .execute(&mut *tx).await?;
+    let (id, hash) = insert_credential(&st, &mut tx, &user, &fields, None).await?;
     tx.commit().await?;
 
     audit::actor_log(
@@ -385,7 +434,10 @@ pub async fn get(
     let c = load(&st, &user, id).await?;
     let ev = evaluate(&c, &fetch_approvals(&st.db, id).await?);
     let t = fetch_event(&st.db, id, &c).await?;
-    Ok(Json(full_view(&c, &ev, t.as_ref())))
+    let mut view = full_view(&c, &ev, t.as_ref());
+    view["supersedes"] = json!(c.supersedes);
+    view["superseded_by"] = json!(successor(&st, id).await?);
+    Ok(Json(view))
 }
 
 /// (stage that must sign next, status after signing)
@@ -651,6 +703,155 @@ pub async fn backfill_events(st: &AppState) -> Res<()> {
     Ok(())
 }
 
+/// Everything verification concludes about one credential.
+pub struct Assessment {
+    pub ev: Evaluation,
+    pub term: Option<Termination>,
+    pub anchor: Option<crate::ledger::Anchor>,
+    pub verdict: &'static str,
+}
+
+async fn assess(st: &AppState, c: &CredRow) -> Res<Assessment> {
+    let ev = evaluate(c, &fetch_approvals(&st.db, c.id).await?);
+    let term = fetch_event(&st.db, c.id, c).await?;
+    let anchor = crate::ledger::anchor_for(&st.db, c).await?;
+    let mut verdict = verdict(c, &ev, term.as_ref());
+    if verdict == "VALID" && anchor.as_ref().is_some_and(|a| !a.ok) {
+        verdict = "INVALID";
+    }
+    Ok(Assessment {
+        ev,
+        term,
+        anchor,
+        verdict,
+    })
+}
+
+async fn load_row(st: &AppState, id: Uuid) -> Res<CredRow> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {CRED_COLS} FROM credentials WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(&st.db)
+    .await?)
+}
+
+/// The credential that replaced this one (the latest, if it was re-issued more than once) and its verdict.
+async fn successor(st: &AppState, id: Uuid) -> Res<Option<Value>> {
+    let next: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM credentials WHERE supersedes = $1 ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&st.db)
+    .await?;
+    let Some((next,)) = next else {
+        return Ok(None);
+    };
+    let c = load_row(st, next).await?;
+    let a = assess(st, &c).await?;
+    Ok(Some(
+        json!({ "id": next, "verdict": a.verdict, "status": c.status }),
+    ))
+}
+
+/// Only credentials that are dead (revoked or rejected) or invalid can be replaced; a valid or pending
+/// one must first be revoked or finished.
+fn can_reissue(verdict: &str) -> bool {
+    matches!(verdict, "REVOKED" | "REJECTED" | "INVALID")
+}
+
+#[derive(Deserialize, Default)]
+pub struct ReissueBody {
+    student_id: Option<String>,
+    student_name: Option<String>,
+    program: Option<String>,
+    graduation_date: Option<String>,
+    gpa: Option<String>,
+    honors: Option<String>,
+}
+
+/// Replaces a revoked, rejected or invalid credential with a new one that points back at it. Fields left
+/// out are copied from the old credential, but only if its stored content still passes its integrity check.
+/// The new credential is signed by the faculty stage and then goes through every stage again, because every
+/// signature is bound to a credential's id and content hash.
+pub async fn reissue(
+    State(st): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+    Json(b): Json<ReissueBody>,
+) -> Res<(StatusCode, Json<Value>)> {
+    user.require(&[Role::Faculty])?;
+    let old = load(&st, &user, id).await?;
+    let a = assess(&st, &old).await?;
+    if !can_reissue(a.verdict) {
+        return Err(AppError::Conflict(format!(
+            "credential is {}; only a revoked, rejected or invalid credential can be re-issued",
+            a.verdict
+        )));
+    }
+    let trusted = a.ev.hash_ok;
+    let pick = |name: &str, given: Option<String>, stored: &str| -> Res<String> {
+        match (given, trusted) {
+            (Some(v), _) => Ok(v),
+            (None, true) => Ok(stored.to_string()),
+            (None, false) => Err(AppError::BadRequest(format!(
+                "this credential's stored content fails its integrity check, so '{name}' cannot be copied; supply every field"
+            ))),
+        }
+    };
+    let optional = |given: Option<String>, stored: &Option<String>| -> Option<String> {
+        match (given, trusted) {
+            (Some(v), _) => Some(v),
+            (None, true) => stored.clone(),
+            (None, false) => None,
+        }
+    };
+    let fields = parse_fields(CreateBody {
+        student_id: pick("student_id", b.student_id, &old.student_id)?,
+        student_name: pick("student_name", b.student_name, &old.student_name)?,
+        program: pick("program", b.program, &old.program)?,
+        graduation_date: pick(
+            "graduation_date",
+            b.graduation_date,
+            &old.graduation_date.to_string(),
+        )?,
+        gpa: optional(b.gpa, &old.gpa),
+        honors: optional(b.honors, &old.honors),
+    })?;
+
+    let mut tx = st.db.begin().await?;
+    lock(&mut tx, id).await?;
+    let live: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM credentials WHERE supersedes = $1 AND status NOT IN ('rejected','revoked') LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((live,)) = live {
+        return Err(AppError::Conflict(format!(
+            "already re-issued as {live}; revoke or reject that one first"
+        )));
+    }
+    let (new_id, hash) = insert_credential(&st, &mut tx, &user, &fields, Some(id)).await?;
+    tx.commit().await?;
+
+    audit::actor_log(
+        &st.db,
+        &user,
+        "CREDENTIAL_REISSUED",
+        "credential",
+        &new_id.to_string(),
+        json!({ "replaces": id, "was": a.verdict, "hash": hash }),
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(
+            json!({ "id": new_id, "replaces": id, "credential_hash": hash, "status": "pending_exam_cell" }),
+        ),
+    ))
+}
+
 #[derive(Deserialize)]
 pub struct VerifyQuery {
     h: Option<String>,
@@ -662,23 +863,17 @@ pub async fn verify(
     Path(id): Path<Uuid>,
     Query(q): Query<VerifyQuery>,
 ) -> Res<Json<Value>> {
-    let c: CredRow = sqlx::query_as(&format!(
-        "SELECT {CRED_COLS} FROM credentials WHERE id = $1"
-    ))
-    .bind(id)
-    .fetch_one(&st.db)
-    .await?;
-    let ev = evaluate(&c, &fetch_approvals(&st.db, id).await?);
-    let t = fetch_event(&st.db, id, &c).await?;
-    let anchor = crate::ledger::anchor_for(&st.db, &c).await?;
+    let c = load_row(&st, id).await?;
+    let Assessment {
+        ev,
+        term: t,
+        anchor,
+        verdict,
+    } = assess(&st, &c).await?;
     let qr_match =
         q.h.as_deref()
             .filter(|h| h.len() >= 8)
             .map(|h| c.credential_hash.starts_with(&h.to_lowercase()));
-    let mut verdict = verdict(&c, &ev, t.as_ref());
-    if verdict == "VALID" && anchor.as_ref().is_some_and(|a| !a.ok) {
-        verdict = "INVALID";
-    }
     Ok(Json(json!({
         "verdict": verdict,
         "credential": {
@@ -688,6 +883,8 @@ pub async fn verify(
             "revoked_at": t.as_ref().filter(|t| t.row.kind == "revoked").map(|t| t.row.created_at),
             "revoke_reason": t.as_ref().map(|t| t.row.reason.as_str()),
         },
+        "supersedes": c.supersedes,
+        "superseded_by": successor(&st, id).await?,
         "termination": t.as_ref().map(|t| t.row.view(t.valid)),
         "checks": { "hash_ok": ev.hash_ok, "order_ok": ev.order_ok, "status_ok": ev.status_ok, "signatures_ok": ev.sigs_ok(), "termination_ok": termination_ok(&c, t.as_ref()) },
         "signatures": ev.sigs,
@@ -742,6 +939,7 @@ mod tests {
             revoke_reason: None,
             block_height: None,
             leaf_index: None,
+            supersedes: None,
         }
     }
 
@@ -903,6 +1101,51 @@ mod tests {
                 want,
                 "{status} intact={intact}"
             );
+        }
+    }
+
+    #[test]
+    fn content_hash_v1_is_unchanged_and_v2_covers_the_link() {
+        let id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let old = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let content = Content {
+            id,
+            student_id: "S-1",
+            student_name: "Ada",
+            program: "BSc",
+            graduation_date: NaiveDate::from_ymd_opt(2025, 5, 15).unwrap(),
+            gpa: Some("3.9"),
+            honors: None,
+            supersedes: None,
+        };
+        // Computed by hand from the canonical form (sorted keys, no whitespace), so credentials issued before
+        // re-issuing existed keep verifying.
+        let v1 = r#"{"gpa":"3.9","graduation_date":"2025-05-15","honors":null,"id":"11111111-1111-1111-1111-111111111111","program":"BSc","student_id":"S-1","student_name":"Ada","v":1}"#;
+        assert_eq!(content.hash(), crypto::sha256_hex(v1.as_bytes()));
+
+        let linked = Content {
+            supersedes: Some(old),
+            ..content
+        };
+        let v2 = r#"{"gpa":"3.9","graduation_date":"2025-05-15","honors":null,"id":"11111111-1111-1111-1111-111111111111","program":"BSc","student_id":"S-1","student_name":"Ada","supersedes":"22222222-2222-2222-2222-222222222222","v":2}"#;
+        assert_eq!(linked.hash(), crypto::sha256_hex(v2.as_bytes()));
+
+        // Editing the link on a stored row breaks its hash.
+        let mut row = cred("pending_exam_cell");
+        row.id = id;
+        row.credential_hash = row.recompute_hash();
+        assert_eq!(row.recompute_hash(), row.credential_hash);
+        row.supersedes = Some(old);
+        assert_ne!(row.recompute_hash(), row.credential_hash);
+    }
+
+    #[test]
+    fn only_dead_or_invalid_credentials_can_be_reissued() {
+        for v in ["REVOKED", "REJECTED", "INVALID"] {
+            assert!(can_reissue(v), "{v}");
+        }
+        for v in ["VALID", "PENDING"] {
+            assert!(!can_reissue(v), "{v}");
         }
     }
 

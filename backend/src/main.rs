@@ -111,6 +111,10 @@ pub fn router(st: AppState) -> Router {
             post(credentials::approve),
         )
         .route("/api/v1/credentials/:id/reject", post(credentials::reject))
+        .route(
+            "/api/v1/credentials/:id/reissue",
+            post(credentials::reissue),
+        )
         .route("/api/v1/credentials/:id/revoke", post(credentials::revoke))
         .route("/api/v1/keys/:role/rotate", post(keys::rotate))
         .route("/api/v1/keys/:id/revoke", post(keys::revoke))

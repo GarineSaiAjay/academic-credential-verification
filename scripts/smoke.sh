@@ -149,6 +149,54 @@ call GET /verify/$ID; yes "a restart re-signs the missing event: REVOKED again" 
 yes "marked as added later" "$(echo "$BODY" | j "d['termination']['legacy']")" True
 yes "with a valid signature" "$(echo "$BODY" | j "d['termination']['valid']")" True
 
+echo "== re-issue"
+vd() { echo "$BODY" | j "d['verdict']"; }
+approve_all() { for t in "$EXC" "$REG" "$ADM"; do call POST /credentials/$1/approve "$t"; done; }
+call POST /credentials/$ID3/reissue "$FAC" '{}'; check "a VALID credential cannot be re-issued" 409
+call POST /credentials "$FAC" "$BODY_C"; PEND=$(echo "$BODY" | j "d['id']")
+call POST /credentials/$PEND/reissue "$FAC" '{}'; check "a PENDING credential cannot be re-issued" 409
+call POST /credentials/$ID/reissue "$EXC" '{}'; check "only faculty can re-issue" 403
+call POST /credentials/$ID/reissue "$FAC" '{}'; check "a revoked credential is re-issued" 201
+NEW1=$(echo "$BODY" | j "d['id']"); yes "response names the credential it replaces" "$(echo "$BODY" | j "d['replaces']")" "$ID"
+call GET /verify/$NEW1; yes "the replacement starts PENDING" "$(vd)" PENDING
+yes "and points back at the old one" "$(echo "$BODY" | j "d['supersedes']")" "$ID"
+yes "with a different content hash" "$(echo "$BODY" | j "d['credential']['credential_hash'] != '$HASH'")" True
+call POST /credentials/$ID/reissue "$FAC" '{}'; check "cannot re-issue while a live replacement exists" 409
+approve_all $NEW1
+call GET /verify/$NEW1; yes "the replacement goes through every stage and is VALID" "$(vd)" VALID
+call GET /verify/$ID; yes "the old credential still reads REVOKED" "$(vd)" REVOKED
+yes "and points to its replacement" "$(echo "$BODY" | j "d['superseded_by']['id']")" "$NEW1"
+yes "which is VALID" "$(echo "$BODY" | j "d['superseded_by']['verdict']")" VALID
+
+call POST /credentials/$ID2/reissue "$FAC" '{"student_name":"Ada Lovelace-King"}'; check "a rejected credential is re-issued with a correction" 201
+NEW2=$(echo "$BODY" | j "d['id']")
+call GET /credentials/$NEW2 "$FAC"
+yes "the corrected field is used" "$(echo "$BODY" | j "d['student_name']")" "Ada Lovelace-King"
+yes "other fields are copied" "$(echo "$BODY" | j "d['program']")" "BSc Computer Science"
+
+DBX "UPDATE credentials SET supersedes='$ID' WHERE id='$ID3'" >/dev/null
+call GET /verify/$ID3; yes "editing the replaces link breaks the content hash" "$(vd)" INVALID
+yes "and the check says so" "$(echo "$BODY" | j "d['checks']['hash_ok']")" False
+DBX "UPDATE credentials SET supersedes=NULL WHERE id='$ID3'" >/dev/null
+call GET /verify/$ID3; yes "link removed, VALID again" "$(vd)" VALID
+
+call POST /credentials "$FAC" "$BODY_C"; TAMP=$(echo "$BODY" | j "d['id']"); approve_all $TAMP
+DBX "UPDATE credentials SET student_name='Mallory' WHERE id='$TAMP'" >/dev/null
+call GET /verify/$TAMP; yes "a tampered credential is INVALID" "$(vd)" INVALID
+call POST /credentials/$TAMP/reissue "$FAC" '{}'; check "its stored content is not copied" 400
+call POST /credentials/$TAMP/reissue "$FAC" '{"student_id":"STU-1","student_name":"Ada Lovelace","program":"BSc Computer Science","graduation_date":"2025-05-15"}'; check "but it can be re-issued with explicit fields" 201
+
+# A stage key is compromised: everything it signed becomes INVALID, and can be replaced.
+call GET /keys "$ADM"; EKEY=$(echo "$BODY" | j "[k['id'] for k in d['keys'] if k['role']=='exam_cell' and k['status']=='active'][0]")
+call POST /keys/$EKEY/revoke "$ADM" '{"reason":"smoke: compromised"}'; check "revoke the exam cell key" 200
+call GET /verify/$ID3; yes "a credential signed by the revoked key reads INVALID" "$(vd)" INVALID
+call POST /keys/exam_cell/rotate "$ADM"; check "rotate the exam cell key" 200
+call POST /credentials/$ID3/reissue "$FAC" '{}'; check "it is re-issued from its (intact) content" 201
+NEW3=$(echo "$BODY" | j "d['id']"); approve_all $NEW3
+call GET /verify/$NEW3; yes "the replacement, signed with the new key, is VALID" "$(vd)" VALID
+call GET /verify/$ID3; yes "the old one points to the valid replacement" "$(echo "$BODY" | j "d['superseded_by']['verdict']")" VALID
+call GET /audit "$ADM"; yes "re-issue is audited" "$(echo "$BODY" | j "any(l['action']=='CREDENTIAL_REISSUED' for l in d['logs'])")" True
+
 echo "== user management"
 # Budget: the login limiter allows 10/min per IP and 6 logins are already used, so this section makes 4.
 UEMAIL="smoke-$RANDOM$RANDOM@university.edu"; P1="smoke-pass-one-1"; P2="smoke-pass-two-2"; P3="smoke-pass-three-3"

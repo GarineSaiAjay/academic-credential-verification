@@ -169,11 +169,14 @@ export function CredDetail({ id, role }: { id: string; role: Role }) {
               <tr><th>Content hash</th><td className="mono">{c.credential_hash}</td></tr>
               <tr><th>Anchored</th><td>{c.block_height ? `block #${c.block_height}, leaf ${c.leaf_index}` : 'not yet'}</td></tr>
               {c.revoke_reason && <tr><th>Reason</th><td>{c.revoke_reason}</td></tr>}
+              {c.supersedes && <tr><th>Replaces</th><td><a href={`#/c/${c.supersedes}`}>{short(c.supersedes)}</a></td></tr>}
+              {c.superseded_by && <tr><th>Replaced by</th><td><a href={`#/c/${c.superseded_by.id}`}>{short(c.superseded_by.id)}</a> <Verdict v={c.superseded_by.verdict} /></td></tr>}
               {c.termination && <tr><th>Signed {c.termination.kind}</th><td className={c.termination.valid ? 'good' : 'bad'}>{c.termination.valid ? `signature valid (${c.termination.stage.replace('_', ' ')} key${c.termination.legacy ? ', added later for an older record' : ''})` : 'SIGNATURE INVALID'}</td></tr>}
             </tbody></table>
             <div className="toolbar">
               {canSign && <button onClick={() => run(() => api('POST', `/credentials/${id}/approve`), 'Signed', reload)}>Sign as {role.replace('_', ' ')}</button>}
               {canSign && <button className="danger" onClick={() => { const r = reason('Reason for rejection'); r && run(() => api('POST', `/credentials/${id}/reject`, { reason: r }), 'Rejected', reload); }}>Reject</button>}
+              {role === 'faculty' && ['REVOKED', 'REJECTED', 'INVALID'].includes(c.verdict) && (!c.superseded_by || ['rejected', 'revoked'].includes(c.superseded_by.status)) && <button onClick={() => window.confirm('Create a new credential from this one? It goes through every approval stage again.') && run(() => api<{ id: string }>('POST', `/credentials/${id}/reissue`, {}).then((r) => go(`/c/${r.id}`)), 'Re-issued')}>Re-issue</button>}
               {role === 'university_admin' && c.status === 'issued' && <button className="danger" onClick={() => { const r = reason('Reason for revocation'); r && run(() => api('POST', `/credentials/${id}/revoke`, { reason: r }), 'Revoked', reload); }}>Revoke</button>}
               <a className="btn" href={`#/verify/${id}/${short(c.credential_hash, 16)}`}>Public verification page</a>
             </div>
@@ -206,6 +209,8 @@ export function Verify({ id, h }: { id?: string; h?: string }) {
         <>
           <Card title="Verification result">
             <p><Verdict v={v.verdict} /></p>
+            {v.superseded_by && <div className={v.superseded_by.verdict === 'VALID' ? 'notice ok' : 'notice err'}>This credential was replaced by <a href={`#/verify/${v.superseded_by.id}`}>{short(v.superseded_by.id)}</a>, which currently reads {v.superseded_by.verdict}.</div>}
+            {v.supersedes && <div className="notice ok">This credential replaces <a href={`#/verify/${v.supersedes}`}>{short(v.supersedes)}</a>.</div>}
             {v.qr_hash_match === false && <div className="notice err">The QR code does not match this credential's current content hash. Treat the printout as forged.</div>}
             <table className="kv"><tbody>
               <tr><th>Student</th><td>{v.credential.student_name}</td></tr>
