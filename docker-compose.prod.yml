@@ -1,0 +1,117 @@
+# Production stack:  internet -> edge (Caddy, TLS) -> waf (OWASP CRS) -> frontend (nginx) -> backend -> postgres
+# Only the edge publishes ports (80 and 443). Needs DOMAIN in .env, with DNS pointing at this host.
+#   docker compose -f docker-compose.prod.yml up -d --build
+# Demo users are never created here; create the first admin with BOOTSTRAP_ADMIN_EMAIL/PASSWORD (see README).
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: acvs
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/gen-env.sh}
+      POSTGRES_DB: acvs
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acvs"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://acvs:${POSTGRES_PASSWORD}@postgres:5432/acvs
+      JWT_SECRET: ${JWT_SECRET:?run scripts/gen-env.sh}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?run scripts/gen-env.sh}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+      PUBLIC_BASE_URL: https://${DOMAIN:?set DOMAIN in .env}
+      TRUST_PROXY: "true"
+      RUST_LOG: info
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./deploy/real-ip.conf:/etc/nginx/acvs/real-ip.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:3000/"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      default:
+        ipv4_address: 172.29.250.12
+
+  waf:
+    image: owasp/modsecurity-crs:4.30.0-nginx-alpine-202610180210
+    restart: unless-stopped
+    depends_on:
+      frontend:
+        condition: service_healthy
+    environment:
+      BACKEND: http://frontend:3000
+      PORT: "8080"
+      # on = block, DetectionOnly = log only (use while tuning for false positives).
+      MODSEC_RULE_ENGINE: ${WAF_MODE:-on}
+      BLOCKING_PARANOIA: ${WAF_PARANOIA:-1}
+      # Trust only the edge, and read the client address it supplies.
+      SET_REAL_IP_FROM: 172.29.250.10
+      REAL_IP_HEADER: X-Forwarded-For
+      SERVER_HEADER: ""
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      default:
+        ipv4_address: 172.29.250.11
+
+  edge:
+    image: caddy:2.11.7-alpine
+    restart: unless-stopped
+    depends_on:
+      waf:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      default:
+        ipv4_address: 172.29.250.10
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.29.250.0/24
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:

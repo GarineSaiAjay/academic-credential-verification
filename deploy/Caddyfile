@@ -1,0 +1,18 @@
+# TLS edge. Caddy obtains and renews a certificate for $DOMAIN by itself (ACME / Let's Encrypt),
+# redirects HTTP to HTTPS, and for "localhost" uses its own local CA (for testing only).
+{$DOMAIN} {
+	encode zstd gzip
+
+	# The API accepts at most 16 KB; refuse anything larger before it reaches the WAF.
+	request_body {
+		max_size 32KB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+
+	# Caddy replaces any client-supplied X-Forwarded-For with the real peer address.
+	reverse_proxy waf:8080
+}
