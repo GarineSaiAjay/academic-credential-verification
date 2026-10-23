@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf, time::Duration};
+use std::{env, net::IpAddr, path::PathBuf, time::Duration};
 
 use crate::crypto::KeyRing;
 
@@ -41,7 +41,8 @@ pub struct Config {
     pub enc_key: KeyRing,
     pub bind: String,
     pub public_base_url: String,
-    pub trust_proxy: bool,
+    /// Addresses of the reverse proxies whose `X-Forwarded-For` is believed. Empty: the header is ignored.
+    pub trusted_proxies: Vec<Cidr>,
     pub seed_password: Option<String>,
     pub bootstrap_admin: Option<(String, String)>,
     pub tsa: Option<TsaConfig>,
@@ -51,6 +52,74 @@ pub struct Config {
     pub require_personal: bool,
     /// Even a person's first key needs an administrator to open the enrolment window.
     pub require_admin_enrollment: bool,
+}
+
+/// An address range such as `172.29.250.0/24`; a bare address is a range of one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cidr {
+    net: IpAddr,
+    bits: u8,
+}
+
+impl Cidr {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (addr, bits) = match s.split_once('/') {
+            Some((a, b)) => (a, Some(b)),
+            None => (s, None),
+        };
+        let net: IpAddr = addr
+            .trim()
+            .parse()
+            .map_err(|_| format!("'{s}' is not an IP address or range"))?;
+        let max = if net.is_ipv4() { 32 } else { 128 };
+        let bits = match bits {
+            Some(b) => b
+                .trim()
+                .parse::<u8>()
+                .ok()
+                .filter(|b| *b <= max)
+                .ok_or_else(|| format!("'{s}': the prefix length must be 0-{max}"))?,
+            None => max,
+        };
+        Ok(Self { net, bits })
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        // An IPv4-mapped IPv6 address (::ffff:a.b.c.d) is that IPv4 address.
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            v4 => v4,
+        };
+        match (self.net, ip) {
+            (IpAddr::V4(n), IpAddr::V4(a)) => {
+                let mask = u32::MAX.checked_shl(32 - u32::from(self.bits)).unwrap_or(0);
+                u32::from(n) & mask == u32::from(a) & mask
+            }
+            (IpAddr::V6(n), IpAddr::V6(a)) => {
+                let mask = u128::MAX
+                    .checked_shl(128 - u32::from(self.bits))
+                    .unwrap_or(0);
+                u128::from(n) & mask == u128::from(a) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+fn trusted_proxies() -> Result<Vec<Cidr>, String> {
+    let list = optional("TRUSTED_PROXIES");
+    if list.is_none() && optional("TRUST_PROXY").is_some_and(|v| v == "true") {
+        return Err("TRUST_PROXY is no longer used: it trusted whatever the connecting host sent. \
+            List the address(es) of your reverse proxy in TRUSTED_PROXIES (comma-separated addresses or ranges, \
+            e.g. 172.29.250.12), or leave it unset to ignore X-Forwarded-For"
+            .into());
+    }
+    list.map(|l| {
+        l.split(',')
+            .map(|c| Cidr::parse(c).map_err(|e| format!("TRUSTED_PROXIES: {e}")))
+            .collect()
+    })
+    .unwrap_or_else(|| Ok(Vec::new()))
 }
 
 fn optional(name: &str) -> Option<String> {
@@ -172,6 +241,7 @@ impl Config {
             login_account_failures: bounded("LOGIN_ACCOUNT_FAILURES", 20, 1, 10_000)? as u32,
             login_account_window_secs: bounded("LOGIN_ACCOUNT_WINDOW_SECS", 900, 10, 86_400)?,
         };
+        let trusted_proxies = trusted_proxies()?;
         let webauthn = webauthn_config(&public_base_url, optional("WEBAUTHN_RP_ID"))?;
         Ok(Self {
             database_url: required("DATABASE_URL")?,
@@ -179,9 +249,7 @@ impl Config {
             enc_key,
             bind: env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".into()),
             public_base_url,
-            trust_proxy: env::var("TRUST_PROXY")
-                .map(|v| v == "true")
-                .unwrap_or(false),
+            trusted_proxies,
             seed_password: optional("SEED_DEMO_PASSWORD"),
             bootstrap_admin,
             tsa,

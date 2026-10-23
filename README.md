@@ -100,6 +100,10 @@ attack payloads blocked, forged headers ignored) and runs the whole smoke suite 
 It does not talk to Let's Encrypt, so first-time issuance on your real domain is the one thing it cannot prove: watch
 `docker compose -f docker-compose.prod.yml logs edge` on first start.
 
+## Client addresses behind a proxy
+
+Rate limits and the audit log use the client's address. The backend believes `X-Forwarded-For` only when the connection comes from an address in `TRUSTED_PROXIES` (comma-separated addresses or ranges such as `172.29.250.12` or `10.0.0.0/8`). Then it reads the header from the right, skipping trusted proxies, and takes the first address that is not one: whatever the client wrote further left is ignored, so a client cannot pick its own address even if a proxy appends instead of replacing. Anyone else connecting, or a malformed header, gets the connecting address. With `TRUSTED_PROXIES` unset the header is ignored entirely. The old `TRUST_PROXY=true` is refused at startup because it trusted whoever connected. The development compose file trusts loopback and the private ranges Docker uses; the production one trusts only the web container's fixed address.
+
 ## Request limits
 
 Limits are counted in Postgres (table `rate_limits`), so they are exact across any number of backend instances and survive restarts, with no extra service to run. A small in-memory check in front sheds floods without touching the database, and if the database is slow or down the limiter falls back to counting per process instead of stalling requests.

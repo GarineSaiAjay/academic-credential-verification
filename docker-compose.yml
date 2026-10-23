@@ -41,7 +41,8 @@ services:
       LOGIN_IP_PER_MIN: ${LOGIN_IP_PER_MIN:-}
       LOGIN_ACCOUNT_FAILURES: ${LOGIN_ACCOUNT_FAILURES:-}
       LOGIN_ACCOUNT_WINDOW_SECS: ${LOGIN_ACCOUNT_WINDOW_SECS:-}
-      TRUST_PROXY: "true"
+      # Only the web container reaches the API, over the private compose network. Narrow this to its address if you can.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       RUST_LOG: info
     # The API writes nothing to disk, so it runs unprivileged on a read-only filesystem with no capabilities.
     read_only: true

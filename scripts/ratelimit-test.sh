@@ -74,7 +74,7 @@ dc up -d --build --wait --scale backend=2 >/dev/null 2>&1 && ok "stack healthy" 
 [ "$(dc ps -q backend | wc -l | tr -d ' ')" = 2 ] && ok "two backend instances are running" || bad "expected two instances"
 
 s_shared() {
-  local a=$1 ip=10.77.$1.1 all401=1 i
+  local a=$1 ip=100.77.$1.1 all401=1 i
   for i in $(seq 1 10); do login $((i % 2 + 1)) $ip "nobody$i@example.com" "wrong-password-$i"; [ "$CODE" = 401 ] || all401=0; done
   [ $all401 = 1 ] && ok "ten login attempts, alternating between the two instances, are all allowed" || bad "an early attempt was refused"
   login 1 $ip "nobody11@example.com" "wrong-password"; expect "the 11th is refused by instance 1" "$CODE" 429
@@ -82,13 +82,13 @@ s_shared() {
   login 2 $ip "nobody12@example.com" "wrong-password"; expect "and instance 2 refuses it too (a per-process limiter would have allowed 10 more)" "$CODE" 429
   case "$retry" in ''|*[!0-9]*) bad "no numeric Retry-After header (got '$retry')" ;; *) [ "$retry" -ge 1 ] && [ "$retry" -le 60 ] && ok "the refusal carries Retry-After: $retry" || bad "Retry-After out of range: $retry" ;; esac
   expect "the body says when to retry" "$(echo "$body" | j "d['retry_after']==$retry")" True
-  login 1 10.77.$a.2 "nobody@example.com" "wrong-password"; expect "another client address is unaffected" "$CODE" 401
+  login 1 100.77.$a.2 "nobody@example.com" "wrong-password"; expect "another client address is unaffected" "$CODE" 401
 }
 echo "== the limit is shared by every instance"
 in_one_window s_shared
 
 s_restart() {
-  local ip=10.76.$1.1 i
+  local ip=100.76.$1.1 i
   for i in $(seq 1 11); do login $((i % 2 + 1)) $ip "nobody$i@example.com" "wrong-password"; done
   expect "(setup) the address is over its limit" "$CODE" 429
   dc restart backend >/dev/null 2>&1; dc up -d --wait --scale backend=2 >/dev/null 2>&1
@@ -100,29 +100,29 @@ in_one_window s_restart
 
 s_account() {
   local i
-  for i in 1 2 3 4 5; do login $((i % 2 + 1)) 10.78.$1.$i "faculty@university.edu" "wrong-password-$i"; [ "$CODE" = 401 ] || bad "failure $i was $CODE"; done
+  for i in 1 2 3 4 5; do login $((i % 2 + 1)) 100.78.$1.$i "faculty@university.edu" "wrong-password-$i"; [ "$CODE" = 401 ] || bad "failure $i was $CODE"; done
   ok "five failures from five different addresses are each answered 401"
-  login 1 10.78.$1.50 "faculty@university.edu" "$PASS"; expect "the account is now throttled, even for the right password, from a new address" "$CODE" 429
-  login 2 10.78.$1.51 "examcell@university.edu" "$PASS"; expect "other accounts are not affected" "$CODE" 200
-  for i in 1 2 3 4 5; do login 1 10.78.$1.1$i "ghost@example.com" "wrong-password"; done
-  login 1 10.78.$1.99 "ghost@example.com" "wrong-password"; expect "an account that does not exist is throttled identically (no way to tell registered emails apart)" "$CODE" 429
+  login 1 100.78.$1.50 "faculty@university.edu" "$PASS"; expect "the account is now throttled, even for the right password, from a new address" "$CODE" 429
+  login 2 100.78.$1.51 "examcell@university.edu" "$PASS"; expect "other accounts are not affected" "$CODE" 200
+  for i in 1 2 3 4 5; do login 1 100.78.$1.1$i "ghost@example.com" "wrong-password"; done
+  login 1 100.78.$1.99 "ghost@example.com" "wrong-password"; expect "an account that does not exist is throttled identically (no way to tell registered emails apart)" "$CODE" 429
 }
 echo "== guessing one account from many addresses is throttled (limit: 5 failures per minute here)"
 in_one_window s_account
-login 1 10.78.9.1 "admin@university.edu" "$PASS"; ADM_TOKEN=$(echo "$BODY" | j "d['token']")
-req 1 GET "/api/v1/audit?limit=100" 10.78.9.1 "$ADM_TOKEN"
+login 1 100.78.9.1 "admin@university.edu" "$PASS"; ADM_TOKEN=$(echo "$BODY" | j "d['token']")
+req 1 GET "/api/v1/audit?limit=100" 100.78.9.1 "$ADM_TOKEN"
 expect "throttled attempts are audit-logged" "$(echo "$BODY" | j "any(l['action']=='LOGIN_THROTTLED' for l in d['logs'])")" True
 expect "the audit entry does not contain the password" "$(echo "$BODY" | grep -c "$PASS")" 0
 echo "  (waiting for the throttle window to end)"
 for _ in $(seq 1 130); do
-  login 1 10.78.8.$((RANDOM % 200 + 1)) "faculty@university.edu" "$PASS"; [ "$CODE" = 200 ] && break; sleep 2
+  login 1 100.78.8.$((RANDOM % 200 + 1)) "faculty@university.edu" "$PASS"; [ "$CODE" = 200 ] && break; sleep 2
 done
 expect "when the window ends the account works again" "$CODE" 200
 FAC=$(echo "$BODY" | j "d['token']")
-login 2 10.79.9.1 "registrar@university.edu" "$PASS"; REG=$(echo "$BODY" | j "d['token']")
+login 2 100.79.9.1 "registrar@university.edu" "$PASS"; REG=$(echo "$BODY" | j "d['token']")
 
 s_nat() {
-  local ip=10.79.$1.1 ip2=10.79.$1.2 OUT
+  local ip=100.79.$1.1 ip2=100.79.$1.2 OUT
   OUT=$(codes 1 $ip 300 /api/v1/auth/me "$FAC"); expect "a signed-in user can make 300 requests from one address (limit 600 per user)" "$(count_of "$OUT" 200)" 300
   OUT=$(codes 2 $ip 260 /health); [ "$(count_of "$OUT" 200)" = 240 ] && [ "$(count_of "$OUT" 429)" = 20 ] && ok "anonymous requests from that address are cut off at 240 (got: $OUT)" || bad "anonymous limit: $OUT"
   req 1 GET /api/v1/auth/me $ip "$REG"; expect "another signed-in user at the same address is still served" "$CODE" 200
@@ -133,12 +133,12 @@ in_one_window s_nat
 
 echo "== the limiter keeps working when the database does not"
 dc stop postgres >/dev/null 2>&1
-S=$(date +%s); req 1 GET /health 10.80.0.1; E=$(date +%s)
+S=$(date +%s); req 1 GET /health 100.80.0.1; E=$(date +%s)
 [ "$CODE" = 200 ] && [ $((E - S)) -le 3 ] && ok "requests are still answered promptly with the database down" || bad "health with db down: $CODE after $((E - S))s"
-S=$(date +%s); login 1 10.80.0.2 "faculty@university.edu" "$PASS"; E=$(date +%s)
+S=$(date +%s); login 1 100.80.0.2 "faculty@university.edu" "$PASS"; E=$(date +%s)
 [ $((E - S)) -le 8 ] && ok "a login fails fast instead of hanging (HTTP $CODE)" || bad "login hung for $((E - S))s"
 dc start postgres >/dev/null 2>&1; dc up -d --wait --scale backend=2 >/dev/null 2>&1
-for _ in $(seq 1 20); do login 1 10.80.0.3 "nobody@example.com" "x"; [ "$CODE" = 401 ] && break; sleep 2; done
+for _ in $(seq 1 20); do login 1 100.80.0.3 "nobody@example.com" "x"; [ "$CODE" = 401 ] && break; sleep 2; done
 expect "when the database returns, limiting and logins work again" "$CODE" 401
 
 echo "== old counters are cleaned up"

@@ -186,7 +186,7 @@ pub async fn global_rate_limit(
     let (key, limit) = match auth::verified_subject(req.headers(), &st.cfg.jwt_secret) {
         Some(user) => (format!("user:{user}"), st.cfg.rate.user_per_min),
         None => {
-            let ip = client_ip(req.headers(), peer, st.cfg.trust_proxy);
+            let ip = client_ip(req.headers(), peer, &st.cfg.trusted_proxies);
             (format!("ip:{ip}"), st.cfg.rate.ip_per_min)
         }
     };

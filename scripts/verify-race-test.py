@@ -59,7 +59,7 @@ verify_loop() {
   n=0
   while [ -f /tmp/run ]; do
     id=$(cat /tmp/cur); n=$((n+1)); [ "$id" = none ] && continue
-    curl -s -H "X-Forwarded-For: 10.$1.$((n/250%250)).$((n%250))" http://localhost:8000/api/v1/verify/$id
+    curl -s -H "X-Forwarded-For: 100.$1.$((n/250%250)).$((n%250))" http://localhost:8000/api/v1/verify/$id
     echo
   done > /tmp/out.$1
 }
@@ -69,7 +69,7 @@ for id in "$@"; do
   echo $id > /tmp/cur; sleep 0.1
   for t in $EXC $REG $ADM; do
     curl -s -o /dev/null -X POST -H "Authorization: Bearer $t" -H "X-Nonce: $(cat /proc/sys/kernel/random/uuid)" \
-      -H "X-Timestamp: $(date +%s)" -H "X-Forwarded-For: 10.200.0.1" http://localhost:8000/api/v1/credentials/$id/approve
+      -H "X-Timestamp: $(date +%s)" -H "X-Forwarded-For: 100.200.0.1" http://localhost:8000/api/v1/credentials/$id/approve
   done
 done
 sleep 0.2; rm -f /tmp/run; wait

@@ -15,11 +15,12 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::FromRow;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use uuid::Uuid;
 
 use crate::{
     audit,
+    config::Cidr,
     error::{AppError, Res},
     security, AppState,
 };
@@ -165,14 +166,27 @@ impl FromRequestParts<AppState> for AuthUser {
     }
 }
 
-pub fn client_ip(headers: &HeaderMap, peer: SocketAddr, trust_proxy: bool) -> String {
-    if trust_proxy {
-        if let Some(ip) = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-        {
-            return ip.trim().to_string();
+/// The address of the client that made the request.
+///
+/// `X-Forwarded-For` is believed only when the connecting peer is one of `trusted`. Even then each proxy appends
+/// the address it saw, so the list is read from the right: the first address that is not itself a trusted proxy
+/// is the client, and anything further left was written by the client and is ignored. A header that is missing,
+/// malformed, or made up only of trusted addresses leaves the peer address.
+pub fn client_ip(headers: &HeaderMap, peer: SocketAddr, trusted: &[Cidr]) -> String {
+    let is_trusted = |ip: IpAddr| trusted.iter().any(|c| c.contains(ip));
+    if is_trusted(peer.ip()) {
+        let chain = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(str::trim);
+        for hop in chain.rev() {
+            match hop.parse::<IpAddr>() {
+                Ok(ip) if is_trusted(ip) => continue,
+                Ok(ip) => return ip.to_string(),
+                Err(_) => break,
+            }
         }
     }
     peer.ip().to_string()
@@ -203,7 +217,7 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Res<Json<Value>> {
-    let ip = client_ip(&headers, peer, st.cfg.trust_proxy);
+    let ip = client_ip(&headers, peer, &st.cfg.trusted_proxies);
     let hit = security::hit(
         &st,
         &format!("login:{ip}"),
@@ -318,4 +332,98 @@ pub async fn logout(State(st): State<AppState>, user: AuthUser) -> Res<Json<Valu
     )
     .await;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod client_ip_tests {
+    use super::*;
+
+    fn headers(values: &[&str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for v in values {
+            h.append("x-forwarded-for", v.parse().unwrap());
+        }
+        h
+    }
+    fn peer(ip: &str) -> SocketAddr {
+        format!("{ip}:4000").parse().unwrap()
+    }
+    fn trust(list: &[&str]) -> Vec<Cidr> {
+        list.iter().map(|c| Cidr::parse(c).unwrap()).collect()
+    }
+
+    #[test]
+    fn header_is_ignored_unless_the_peer_is_a_trusted_proxy() {
+        let h = headers(&["198.51.100.7"]);
+        assert_eq!(client_ip(&h, peer("203.0.113.5"), &[]), "203.0.113.5");
+        assert_eq!(
+            client_ip(&h, peer("203.0.113.5"), &trust(&["172.29.250.12"])),
+            "203.0.113.5"
+        );
+        assert_eq!(
+            client_ip(&h, peer("172.29.250.12"), &trust(&["172.29.250.12"])),
+            "198.51.100.7"
+        );
+    }
+
+    #[test]
+    fn a_client_cannot_choose_its_address_by_prepending() {
+        // The proxy appended the real client (198.51.100.7); the client had sent "1.2.3.4" itself.
+        let h = headers(&["1.2.3.4, 198.51.100.7"]);
+        assert_eq!(
+            client_ip(&h, peer("10.0.0.2"), &trust(&["10.0.0.0/8"])),
+            "198.51.100.7"
+        );
+        // Several header lines are one list, read from the end.
+        let h = headers(&["1.2.3.4", "198.51.100.7"]);
+        assert_eq!(
+            client_ip(&h, peer("10.0.0.2"), &trust(&["10.0.0.0/8"])),
+            "198.51.100.7"
+        );
+    }
+
+    #[test]
+    fn trusted_hops_are_skipped_from_the_right() {
+        let h = headers(&["1.2.3.4, 198.51.100.7, 10.0.0.9"]);
+        assert_eq!(
+            client_ip(&h, peer("10.0.0.2"), &trust(&["10.0.0.0/8"])),
+            "198.51.100.7"
+        );
+    }
+
+    #[test]
+    fn bad_or_all_trusted_headers_fall_back_to_the_peer() {
+        let t = trust(&["10.0.0.0/8"]);
+        assert_eq!(
+            client_ip(&headers(&["10.0.0.9"]), peer("10.0.0.2"), &t),
+            "10.0.0.2"
+        );
+        assert_eq!(
+            client_ip(&headers(&["198.51.100.7, garbage"]), peer("10.0.0.2"), &t),
+            "10.0.0.2"
+        );
+        assert_eq!(client_ip(&headers(&[]), peer("10.0.0.2"), &t), "10.0.0.2");
+        assert_eq!(client_ip(&headers(&[""]), peer("10.0.0.2"), &t), "10.0.0.2");
+    }
+
+    #[test]
+    fn ranges_and_ipv6() {
+        let c = Cidr::parse("172.29.250.0/24").unwrap();
+        assert!(c.contains("172.29.250.12".parse().unwrap()));
+        assert!(!c.contains("172.29.251.12".parse().unwrap()));
+        assert!(Cidr::parse("0.0.0.0/0")
+            .unwrap()
+            .contains("8.8.8.8".parse().unwrap()));
+        assert!(Cidr::parse("127.0.0.1")
+            .unwrap()
+            .contains("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(Cidr::parse("fd00::/8")
+            .unwrap()
+            .contains("fd12::1".parse().unwrap()));
+        assert!(!Cidr::parse("fd00::/8")
+            .unwrap()
+            .contains("fe80::1".parse().unwrap()));
+        assert!(Cidr::parse("10.0.0.0/33").is_err());
+        assert!(Cidr::parse("nonsense").is_err());
+    }
 }

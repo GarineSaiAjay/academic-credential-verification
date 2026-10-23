@@ -107,6 +107,15 @@ TOKEN=$(login)
 IPS=$(C 'https://localhost/api/v1/audit?limit=10' -H "Authorization: Bearer $TOKEN" | j "sorted({l['details']['ip'] for l in d['logs'] if l['action']=='LOGIN'})")
 echo "$IPS" | grep -q '203.0.113' && bad "a client-supplied address was trusted: $IPS" || ok "forged X-Forwarded-For / X-Real-IP ignored"
 echo "$IPS" | grep -qE "172\.29\.250\.(10|11|12)" && bad "audit log shows an internal proxy address: $IPS" || ok "audit log records the real client address, not a proxy ($IPS)"
+# A client that reaches the API without going through the web container is not a trusted proxy, so its header is
+# ignored too. Here that is a request from inside the backend container itself (the address 127.0.0.1).
+docker compose exec -T backend curl -s -o /dev/null -X POST -H 'Content-Type: application/json' -H 'X-Forwarded-For: 198.51.100.77' \
+  -d "{\"email\":\"admin@university.edu\",\"password\":\"$SEED_DEMO_PASSWORD\"}" http://localhost:8000/api/v1/auth/login
+IPS=$(C 'https://localhost/api/v1/audit?limit=10' -H "Authorization: Bearer $TOKEN" | j "sorted({l['details']['ip'] for l in d['logs'] if l['action']=='LOGIN'})")
+echo "$IPS" | grep -q '198.51.100' && bad "X-Forwarded-For from an untrusted peer was believed: $IPS" || ok "X-Forwarded-For from a peer that is not the web container is ignored"
+echo "$IPS" | grep -q '127.0.0.1' && ok "and the audit log records the connecting address instead" || bad "expected 127.0.0.1 in $IPS"
+OUT=$(docker compose run --rm -T -e TRUST_PROXY=true -e TRUSTED_PROXIES= backend ./server 2>&1); echo "$OUT" | grep -q 'TRUSTED_PROXIES' && ok "the retired TRUST_PROXY=true alone is refused at startup" || bad "TRUST_PROXY=true accepted: $OUT"
+OUT=$(docker compose run --rm -T -e TRUSTED_PROXIES=10.0.0.0/40 backend ./server 2>&1); echo "$OUT" | grep -q 'prefix length' && ok "a malformed TRUSTED_PROXIES is refused at startup" || bad "bad range accepted: $OUT"
 
 echo "== the application, end to end through TLS + WAF"
 # The smoke suite uses the whole per-IP login allowance, and limit counters live in the database (they survive
