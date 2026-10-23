@@ -97,6 +97,54 @@ call GET /verify/$ID2; expect "rejected verdict" "$(echo "$BODY" | j "d['verdict
 call POST /credentials/$ID/revoke "$ADM" '{"reason":"issued in error"}'; check "admin revokes issued" 200
 call GET /verify/$ID; expect "revoked verdict" "$(echo "$BODY" | j "d['verdict']")" REVOKED
 
+echo "== user management"
+# Budget: the login limiter allows 10/min per IP and 6 logins are already used, so this section makes 4.
+UEMAIL="smoke-$RANDOM$RANDOM@university.edu"; P1="smoke-pass-one-1"; P2="smoke-pass-two-2"; P3="smoke-pass-three-3"
+call GET /users "$FAC"; check "faculty cannot list users" 403
+call GET /users "$AUD"; check "auditor cannot list users" 403
+call POST /users "$FAC" "{\"email\":\"$UEMAIL\",\"role\":\"auditor\",\"password\":\"$P1\"}"; check "faculty cannot create users" 403
+call GET /users "$ADM"; check "admin lists users" 200
+call POST /users "$ADM" "{\"email\":\"not-an-email\",\"role\":\"auditor\",\"password\":\"$P1\"}"; check "invalid email rejected" 400
+call POST /users "$ADM" "{\"email\":\"$UEMAIL\",\"role\":\"superuser\",\"password\":\"$P1\"}"; check "unknown role rejected" 400
+call POST /users "$ADM" "{\"email\":\"$UEMAIL\",\"role\":\"auditor\",\"password\":\"short\"}"; check "short password rejected" 400
+call POST /users "$ADM" "{\"email\":\"$UEMAIL\",\"role\":\"auditor\",\"password\":\"$P1\"}"; check "admin creates user" 201
+UID_=$(echo "$BODY" | j "d['id']")
+call POST /users "$ADM" "{\"email\":\"$UEMAIL\",\"role\":\"auditor\",\"password\":\"$P1\"}"; check "duplicate email rejected" 409
+call POST /auth/login "" "{\"email\":\"$UEMAIL\",\"password\":\"$P1\"}"; check "new user logs in" 200
+T1=$(echo "$BODY" | j "d['token']")
+call GET /auth/me "$T1"; expect "new user role" "$(echo "$BODY" | j "d['role']")" auditor
+
+call POST /users/$UID_/role "$FAC" '{"role":"registrar"}'; check "faculty cannot change roles" 403
+call POST /users/$UID_/role "$ADM" '{"role":"nonsense"}'; check "role change rejects unknown role" 400
+call POST /users/$UID_/role "$ADM" '{"role":"exam_cell"}'; check "admin changes role" 200
+call GET /auth/me "$T1"; expect "role change is immediate" "$(echo "$BODY" | j "d['role']")" exam_cell
+call GET /auth/me "$ADM"; ADMID=$(echo "$BODY" | j "d['id']")
+call POST /users/$ADMID/role "$ADM" '{"role":"auditor"}'; check "admin cannot demote self" 409
+call POST /users/$ADMID/active "$ADM" '{"active":false}'; check "admin cannot deactivate self" 409
+call POST /users/$ADMID/password "$ADM" "{\"password\":\"$P3\"}"; check "admin cannot reset own password here" 400
+
+call POST /auth/password "$T1" "{\"current_password\":\"wrong-password-xx\",\"new_password\":\"$P2\"}"; check "change password: wrong current rejected" 400
+call POST /auth/password "$T1" "{\"current_password\":\"$P1\",\"new_password\":\"tiny\"}"; check "change password: short new rejected" 400
+call POST /auth/password "$T1" "{\"current_password\":\"$P1\",\"new_password\":\"$P2\"}"; check "user changes own password" 200
+call GET /auth/me "$T1"; check "current session survives password change" 200
+
+call POST /users/$UID_/active "$ADM" '{"active":false}'; check "admin deactivates user" 200
+call GET /auth/me "$T1"; check "deactivated user's token stops working" 401
+call POST /auth/login "" "{\"email\":\"$UEMAIL\",\"password\":\"$P2\"}"; check "deactivated user cannot log in" 401
+call POST /users/$UID_/active "$ADM" '{"active":true}'; check "admin reactivates user" 200
+call POST /users/$UID_/password "$ADM" '{"password":"short"}'; check "reset rejects short password" 400
+call POST /users/$UID_/password "$ADM" "{\"password\":\"$P3\"}"; check "admin resets password" 200
+call POST /auth/login "" "{\"email\":\"$UEMAIL\",\"password\":\"$P2\"}"; check "old password no longer works" 401
+call POST /auth/login "" "{\"email\":\"$UEMAIL\",\"password\":\"$P3\"}"; check "new password works" 200
+T2=$(echo "$BODY" | j "d['token']")
+call GET /auth/me "$T2"; check "reset user is signed in" 200
+call GET /audit "$ADM"
+for a in USER_CREATED USER_ROLE_CHANGED USER_DEACTIVATED USER_ACTIVATED USER_PASSWORD_RESET PASSWORD_CHANGED; do
+  expect "audit has $a" "$(echo "$BODY" | j "any(l['action']=='$a' and '$UEMAIL' in (l['details'] or {}).get('email','$UEMAIL') for l in d['logs'])")" True
+done
+expect "audit never stores passwords" "$(echo "$BODY" | grep -c -e "$P1" -e "$P2" -e "$P3")" 0
+call POST /users/$UID_/active "$ADM" '{"active":false}'; check "cleanup: deactivate smoke user" 200
+
 echo "== rate limit"
 for i in $(seq 1 15); do call POST /auth/login "" '{"email":"x@y.z","password":"bad"}'; [ "$CODE" = 429 ] && break; done
 check "login throttled under repeated attempts" 429

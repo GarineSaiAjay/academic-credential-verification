@@ -94,7 +94,7 @@ pub fn hash_password(password: &str) -> Res<String> {
         .map_err(|e| AppError::Internal(e.to_string()))
 }
 
-fn verify_password(password: &str, hash: &str) -> bool {
+pub fn verify_password(password: &str, hash: &str) -> bool {
     PasswordHash::new(hash)
         .map(|h| {
             Argon2::default()

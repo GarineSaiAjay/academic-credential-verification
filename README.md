@@ -16,6 +16,12 @@ open http://localhost:3000
 Demo users are created on first start: `faculty@`, `examcell@`, `registrar@`, `admin@`, `auditor@university.edu`.
 The shared password is `SEED_DEMO_PASSWORD` in `.env`. Leave it empty for any real deployment.
 
+**Real deployment: create the first admin.** Leave `SEED_DEMO_PASSWORD` empty and set `BOOTSTRAP_ADMIN_EMAIL` and
+`BOOTSTRAP_ADMIN_PASSWORD` (12-128 characters) in `.env`. On first start, while the `users` table is empty, the backend
+creates that account as `university_admin`. It never runs again once any user exists, and it takes precedence over the
+demo seed. Remove `BOOTSTRAP_ADMIN_PASSWORD` from `.env` after the first start, then create everyone else on the
+**Users** page. If the backend starts with no users and neither variable set, it logs a warning.
+
 Verify everything works (end-to-end checks against the running stack):
 
 ```bash
@@ -43,6 +49,12 @@ Any stage role can also reject. `university_admin` can revoke an issued credenti
 - **Ledger**: `university_admin` seals all issued, un-anchored credentials into a block: Merkle root (0x00/0x01 domain-separated, odd nodes promoted), hash-linked to the previous block, signed with the university key. `GET /api/v1/ledger/verify` re-verifies the whole chain; each credential carries a Merkle inclusion proof.
 - **Key management**: one active key per stage (enforced by a unique index). *Rotate* retires the old key (old signatures stay valid). *Revoke* marks a key compromised: everything it signed verifies as `INVALID` until the stage key is rotated and credentials re-issued. Private keys are stored AES-256-GCM encrypted under `ENCRYPTION_KEY`.
 - `approvals`, `blocks` and `audit_logs` are append-only (database triggers reject UPDATE/DELETE).
+- **User management**: `university_admin` creates users, changes roles, deactivates/reactivates accounts and resets passwords
+  (Users page). Deactivation and password reset sign the user out everywhere; role changes apply on the next request.
+  Admins cannot change their own role or active state, and the last active admin can never be demoted or deactivated
+  (enforced under a row lock, so two admins cannot lock each other out). Every user can change their own password
+  (Account page: click your email in the header), which signs out their other sessions. Passwords are 12-128 characters.
+  All of this is written to the audit log; passwords never are.
 
 ## Security controls
 
@@ -61,7 +73,8 @@ Any stage role can also reject. `university_admin` can revoke an issued credenti
 Public: `POST /auth/login`, `GET /verify/:id`, `GET /credentials/:id/qr`, `GET /ledger/verify`.
 Authenticated: `GET /auth/me`, `POST /auth/logout`, `GET|POST /credentials`, `GET /credentials/:id`,
 `POST /credentials/:id/{approve,reject,revoke}`, `GET /keys`, `POST /keys/:role/rotate`, `POST /keys/:id/revoke`,
-`GET /ledger/blocks`, `POST /ledger/seal`, `GET /audit`. All under `/api/v1`.
+`GET /ledger/blocks`, `POST /ledger/seal`, `GET /audit`, `POST /auth/password`.
+`university_admin` only: `GET|POST /users`, `POST /users/:id/{role,active,password}`. All under `/api/v1`.
 
 ## Limits you should know about
 
@@ -70,7 +83,7 @@ Authenticated: `GET /auth/me`, `POST /auth/logout`, `GET|POST /credentials`, `GE
 - This is not a real WAF: for internet exposure put a managed WAF/CDN and TLS in front of nginx.
 - The encryption key lives in an environment variable. For higher assurance use a KMS/HSM to wrap the signing keys.
 - One signing key per stage, not per person; the audit log records which user triggered each signature.
-- No user-management UI yet: users are rows in `users` (create with `auth::hash_password`-compatible Argon2 hashes).
+- No account lockout, MFA or self-service password *reset* (forgot password); an admin can reset a password for a user.
 
 ## Contributing
 

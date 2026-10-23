@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { getSession } from './api';
-import { Audit, CredDetail, CredList, Keys, Ledger, Login, NewCredential, Verify, go, logout } from './pages';
+import { Account, Audit, CredDetail, CredList, Keys, Ledger, Login, NewCredential, Users, Verify, go, logout } from './pages';
 
 function useHash() {
   const read = () => window.location.hash.replace(/^#/, '') || '/';
@@ -32,6 +32,8 @@ export default function App() {
   else if (parts[0] === 'keys') page = <Keys role={session.role} />;
   else if (parts[0] === 'ledger') page = <Ledger role={session.role} />;
   else if (parts[0] === 'audit') page = <Audit />;
+  else if (parts[0] === 'users' && session.role === 'university_admin') page = <Users me={session.email} />;
+  else if (parts[0] === 'account') page = <Account />;
   else page = <CredList role={session.role} />;
 
   const privileged = session?.role === 'university_admin' || session?.role === 'auditor';
@@ -46,9 +48,10 @@ export default function App() {
           {session && <a href="#/ledger">Ledger</a>}
           {privileged && <a href="#/keys">Keys</a>}
           {privileged && <a href="#/audit">Audit</a>}
+          {session?.role === 'university_admin' && <a href="#/users">Users</a>}
         </nav>
         <span className="who">
-          {session ? (<>{session.email} <span className="muted">({session.role.replace('_', ' ')})</span> · <a href="#/login" onClick={(e) => { e.preventDefault(); logout(); }}>logout</a></>) : <a href="#/login">login</a>}
+          {session ? (<><a href="#/account">{session.email}</a> <span className="muted">({session.role.replace('_', ' ')})</span> · <a href="#/login" onClick={(e) => { e.preventDefault(); logout(); }}>logout</a></>) : <a href="#/login">login</a>}
         </span>
       </header>
       <main>{page}</main>

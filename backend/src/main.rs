@@ -7,6 +7,7 @@ mod error;
 mod keys;
 mod ledger;
 mod security;
+mod users;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -78,10 +79,16 @@ pub fn router(st: AppState) -> Router {
         .route("/api/v1/credentials/:id", get(credentials::get))
         .route("/api/v1/keys", get(keys::list))
         .route("/api/v1/ledger/blocks", get(ledger::blocks))
-        .route("/api/v1/audit", get(audit::list));
+        .route("/api/v1/audit", get(audit::list))
+        .route("/api/v1/users", get(users::list));
 
     let writes = Router::new()
         .route("/api/v1/auth/logout", post(auth::logout))
+        .route("/api/v1/auth/password", post(users::change_password))
+        .route("/api/v1/users", post(users::create))
+        .route("/api/v1/users/:id/role", post(users::set_role))
+        .route("/api/v1/users/:id/active", post(users::set_active))
+        .route("/api/v1/users/:id/password", post(users::reset_password))
         .route("/api/v1/credentials", post(credentials::create))
         .route(
             "/api/v1/credentials/:id/approve",
@@ -163,7 +170,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         limiter: Arc::new(RateLimiter::default()),
     };
     keys::ensure_initial_keys(&st).await?;
+    users::bootstrap_admin(&st).await?;
     seed_demo_users(&st).await?;
+    let (user_count,): (i64,) = sqlx::query_as("SELECT count(*) FROM users")
+        .fetch_one(&st.db)
+        .await?;
+    if user_count == 0 {
+        tracing::warn!(
+            "no users exist, so nobody can sign in; set BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD and restart"
+        );
+    }
 
     let listener = tokio::net::TcpListener::bind(&st.cfg.bind).await?;
     tracing::info!(addr = %st.cfg.bind, "listening");

@@ -316,6 +316,91 @@ export function Audit() {
   );
 }
 
+const ROLES: Role[] = ['faculty', 'exam_cell', 'registrar', 'university_admin', 'auditor'];
+const roleName = (r: string) => r.replace('_', ' ');
+
+export function Users({ me }: { me: string }) {
+  const { data, error, reload } = useLoad<{ users: any[] }>('/users');
+  const { run, banner } = useAction();
+  const [form, setForm] = useState({ email: '', role: 'faculty', password: '' });
+  const [busy, setBusy] = useState(false);
+  const create = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    await run(() => api('POST', '/users', form), `Created ${form.email.trim().toLowerCase()}`, () => { setForm({ email: '', role: 'faculty', password: '' }); reload(); });
+    setBusy(false);
+  };
+  return (
+    <>
+      <Card title="Users">
+        {banner}<Err msg={error} />
+        <table>
+          <thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Created</th><th /></tr></thead>
+          <tbody>
+            {data?.users.map((u) => {
+              const self = u.email === me;
+              return (
+                <tr key={u.id}>
+                  <td>{u.email}{self && <span className="muted"> (you)</span>}</td>
+                  <td>
+                    <select value={u.role} disabled={self} onChange={(e) => run(() => api('POST', `/users/${u.id}/role`, { role: e.target.value }), `${u.email} is now ${roleName(e.target.value)}`, reload)}>
+                      {ROLES.map((r) => <option key={r} value={r}>{roleName(r)}</option>)}
+                    </select>
+                  </td>
+                  <td className={u.active ? 'good' : 'bad'}>{u.active ? 'active' : 'deactivated'}</td>
+                  <td>{when(u.created_at)}</td>
+                  <td>
+                    {!self && (
+                      <>
+                        <button className="small" onClick={() => { const p = window.prompt(`New password for ${u.email} (12-128 characters). They will be signed out everywhere.`); p && run(() => api('POST', `/users/${u.id}/password`, { password: p }), `Password reset for ${u.email}`, reload); }}>Reset password</button>{' '}
+                        <button className={u.active ? 'danger small' : 'small'} onClick={() => (!u.active || window.confirm(`Deactivate ${u.email}? They are signed out immediately.`)) && run(() => api('POST', `/users/${u.id}/active`, { active: !u.active }), `${u.email} ${u.active ? 'deactivated' : 'activated'}`, reload)}>{u.active ? 'Deactivate' : 'Activate'}</button>
+                      </>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </Card>
+      <Card title="Create user">
+        <form onSubmit={create} className="form">
+          <label>Email<input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} required /></label>
+          <label>Role
+            <select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}>
+              {ROLES.map((r) => <option key={r} value={r}>{roleName(r)}</option>)}
+            </select>
+          </label>
+          <label>Initial password (12-128 characters)<input type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} minLength={12} maxLength={128} required autoComplete="new-password" /></label>
+          <button disabled={busy}>{busy ? 'Creating...' : 'Create user'}</button>
+        </form>
+      </Card>
+    </>
+  );
+}
+
+export function Account() {
+  const [form, setForm] = useState({ current_password: '', new_password: '' });
+  const [busy, setBusy] = useState(false);
+  const { run, banner } = useAction();
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    await run(() => api('POST', '/auth/password', form), 'Password changed. Your other sessions were signed out.', () => setForm({ current_password: '', new_password: '' }));
+    setBusy(false);
+  };
+  return (
+    <Card title="Change password">
+      {banner}
+      <form onSubmit={submit} className="form">
+        <label>Current password<input type="password" value={form.current_password} onChange={(e) => setForm({ ...form, current_password: e.target.value })} required autoComplete="current-password" /></label>
+        <label>New password (12-128 characters)<input type="password" value={form.new_password} onChange={(e) => setForm({ ...form, new_password: e.target.value })} minLength={12} maxLength={128} required autoComplete="new-password" /></label>
+        <button disabled={busy}>{busy ? 'Saving...' : 'Change password'}</button>
+      </form>
+    </Card>
+  );
+}
+
 export async function logout() {
   if (getSession()) await api('POST', '/auth/logout').catch(() => undefined);
   setSession(null);
