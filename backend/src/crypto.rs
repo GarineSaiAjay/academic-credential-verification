@@ -26,6 +26,12 @@ pub fn approval_message(credential_id: Uuid, role: &str, credential_hash: &str) 
     format!("ACVS-APPROVAL-v1|{credential_id}|{role}|{credential_hash}").into_bytes()
 }
 
+/// What a person's authenticator is asked to sign for an approval: the SHA-256 of the same message the
+/// stage key signs, used as the WebAuthn challenge.
+pub fn approval_challenge(credential_id: Uuid, role: &str, credential_hash: &str) -> [u8; 32] {
+    Sha256::digest(approval_message(credential_id, role, credential_hash)).into()
+}
+
 /// Bytes signed for a rejection or revocation; binds it to the credential, its content hash, the reason
 /// and the time, so none of them can be altered without breaking the signature.
 pub fn event_message(

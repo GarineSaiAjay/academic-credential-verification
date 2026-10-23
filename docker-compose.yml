@@ -32,6 +32,9 @@ services:
       TSA_CA_FILE: ${TSA_CA_FILE:-}
       TSA_INTERVAL_SECS: ${TSA_INTERVAL_SECS:-}
       TSA_TIMEOUT_SECS: ${TSA_TIMEOUT_SECS:-}
+      REQUIRE_PERSONAL_SIGNATURES: ${REQUIRE_PERSONAL_SIGNATURES:-}
+      REQUIRE_ADMIN_ENROLLMENT: ${REQUIRE_ADMIN_ENROLLMENT:-}
+      WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-}
       TRUST_PROXY: "true"
       RUST_LOG: info
     # The API writes nothing to disk, so it runs unprivileged on a read-only filesystem with no capabilities.

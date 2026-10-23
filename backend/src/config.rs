@@ -10,6 +10,13 @@ pub struct TsaConfig {
     pub timeout: Duration,
 }
 
+/// How browsers identify this site to authenticators (WebAuthn relying party).
+#[derive(Clone)]
+pub struct WebAuthnConfig {
+    pub rp_id: String,
+    pub origin: String,
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
@@ -21,6 +28,11 @@ pub struct Config {
     pub seed_password: Option<String>,
     pub bootstrap_admin: Option<(String, String)>,
     pub tsa: Option<TsaConfig>,
+    pub webauthn: WebAuthnConfig,
+    /// Every approval must carry the approver's personal (WebAuthn) countersignature.
+    pub require_personal: bool,
+    /// Even a person's first key needs an administrator to open the enrolment window.
+    pub require_admin_enrollment: bool,
 }
 
 fn optional(name: &str) -> Option<String> {
@@ -36,6 +48,32 @@ fn seconds(name: &str, default: u64, min: u64, max: u64) -> Result<u64, String> 
             .filter(|n| (min..=max).contains(n))
             .ok_or_else(|| format!("{name} must be a number of seconds between {min} and {max}")),
     }
+}
+
+/// Origin and relying-party id from the public URL; WEBAUTHN_RP_ID may widen the id to a parent domain.
+fn webauthn_config(
+    public_base_url: &str,
+    rp_override: Option<String>,
+) -> Result<WebAuthnConfig, String> {
+    let (scheme, rest) = public_base_url
+        .split_once("://")
+        .filter(|(s, _)| matches!(*s, "http" | "https"))
+        .ok_or("PUBLIC_BASE_URL must start with http:// or https://")?;
+    let host_port = rest.split('/').next().unwrap_or("");
+    let host = host_port.rsplit_once(':').map_or(host_port, |(h, _)| h);
+    if host.is_empty() {
+        return Err("PUBLIC_BASE_URL has no host".into());
+    }
+    let rp_id = rp_override.unwrap_or_else(|| host.to_string());
+    if !(host == rp_id || host.ends_with(&format!(".{rp_id}"))) {
+        return Err(
+            "WEBAUTHN_RP_ID must be the host of PUBLIC_BASE_URL or a parent domain of it".into(),
+        );
+    }
+    Ok(WebAuthnConfig {
+        rp_id,
+        origin: format!("{scheme}://{host_port}"),
+    })
 }
 
 fn required(name: &str) -> Result<String, String> {
@@ -80,21 +118,27 @@ impl Config {
             (None, None) => None,
             _ => return Err("TSA_URL and TSA_CA_FILE must be set together".into()),
         };
+        let public_base_url = env::var("PUBLIC_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:3000".into())
+            .trim_end_matches('/')
+            .to_string();
+        let webauthn = webauthn_config(&public_base_url, optional("WEBAUTHN_RP_ID"))?;
         Ok(Self {
             database_url: required("DATABASE_URL")?,
             jwt_secret,
             enc_key,
             bind: env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".into()),
-            public_base_url: env::var("PUBLIC_BASE_URL")
-                .unwrap_or_else(|_| "http://localhost:3000".into())
-                .trim_end_matches('/')
-                .to_string(),
+            public_base_url,
             trust_proxy: env::var("TRUST_PROXY")
                 .map(|v| v == "true")
                 .unwrap_or(false),
             seed_password: optional("SEED_DEMO_PASSWORD"),
             bootstrap_admin,
             tsa,
+            webauthn,
+            require_personal: optional("REQUIRE_PERSONAL_SIGNATURES").is_some_and(|v| v == "true"),
+            require_admin_enrollment: optional("REQUIRE_ADMIN_ENROLLMENT")
+                .is_some_and(|v| v == "true"),
         })
     }
 }

@@ -1,6 +1,7 @@
 use std::io::Cursor;
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
@@ -9,6 +10,7 @@ use axum::{
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgExecutor};
 use uuid::Uuid;
 
@@ -17,7 +19,7 @@ use crate::{
     auth::{AuthUser, Role},
     crypto,
     error::{AppError, Res},
-    keys, AppState,
+    keys, webauthn, AppState,
 };
 
 pub const STAGES: [&str; 4] = ["faculty", "exam_cell", "registrar", "university"];
@@ -53,6 +55,15 @@ pub struct ApprovalRow {
     pub key_id: Uuid,
     pub public_key: String,
     pub key_status: String,
+    // The approver's personal countersignature, when there is one.
+    pub cs_key_id: Option<Uuid>,
+    pub cs_rp_id: Option<String>,
+    pub cs_origin: Option<String>,
+    pub cs_auth: Option<Vec<u8>>,
+    pub cs_client: Option<Vec<u8>>,
+    pub cs_sig: Option<Vec<u8>>,
+    pub uk_public_key: Option<Vec<u8>>,
+    pub uk_status: Option<String>,
 }
 
 /// A signed rejection or revocation, with the key that signed it.
@@ -187,9 +198,32 @@ impl CredRow {
 
 async fn fetch_approvals<'e>(e: impl PgExecutor<'e>, id: Uuid) -> Res<Vec<ApprovalRow>> {
     Ok(sqlx::query_as(
-        "SELECT a.role, a.signature, a.signed_at, a.key_id, k.public_key, k.status AS key_status
-         FROM approvals a JOIN signing_keys k ON k.id = a.key_id WHERE a.credential_id = $1 ORDER BY a.signed_at, a.id",
+        "SELECT a.role, a.signature, a.signed_at, a.key_id, k.public_key, k.status AS key_status,
+                cs.user_key_id AS cs_key_id, cs.rp_id AS cs_rp_id, cs.origin AS cs_origin,
+                cs.authenticator_data AS cs_auth, cs.client_data_json AS cs_client, cs.signature AS cs_sig,
+                uk.public_key AS uk_public_key, uk.status AS uk_status
+         FROM approvals a JOIN signing_keys k ON k.id = a.key_id
+         LEFT JOIN approval_countersigs cs ON cs.approval_id = a.id
+         LEFT JOIN user_keys uk ON uk.id = cs.user_key_id
+         WHERE a.credential_id = $1 ORDER BY a.signed_at, a.id",
     ).bind(id).fetch_all(e).await?)
+}
+
+/// A person's countersignature on an approval, with everything needed to re-verify it independently.
+#[derive(Serialize)]
+pub struct PersonalView {
+    pub valid: bool,
+    pub key_id: Uuid,
+    /// First bytes of the SHA-256 of the public key: identifies the key without naming its owner.
+    pub fingerprint: String,
+    pub key_status: String,
+    /// base64url DER SubjectPublicKeyInfo (P-256).
+    pub public_key: String,
+    pub rp_id: String,
+    pub origin: String,
+    pub authenticator_data: String,
+    pub client_data_json: String,
+    pub signature: String,
 }
 
 #[derive(Serialize)]
@@ -200,6 +234,7 @@ pub struct SigView {
     pub key_status: String,
     pub public_key: String,
     pub signed_at: DateTime<Utc>,
+    pub personal: Option<PersonalView>,
 }
 
 pub struct Evaluation {
@@ -215,9 +250,54 @@ impl Evaluation {
             .iter()
             .all(|s| s.valid && s.key_status != "revoked")
     }
-    pub fn intact(&self) -> bool {
-        self.hash_ok && self.order_ok && self.status_ok && self.sigs_ok()
+    /// Every personal countersignature that is present verifies and uses a key that is not revoked.
+    /// A missing one is not an error here: it is a policy the deployment enforces when approving.
+    pub fn personal_ok(&self) -> bool {
+        self.sigs
+            .iter()
+            .all(|s| s.personal.as_ref().is_none_or(|p| p.valid))
     }
+    pub fn intact(&self) -> bool {
+        self.hash_ok && self.order_ok && self.status_ok && self.sigs_ok() && self.personal_ok()
+    }
+}
+
+fn personal_view(c: &CredRow, a: &ApprovalRow) -> Option<PersonalView> {
+    let key_id = a.cs_key_id?;
+    let (spki, auth, client, sig) = (
+        a.uk_public_key.clone().unwrap_or_default(),
+        a.cs_auth.clone().unwrap_or_default(),
+        a.cs_client.clone().unwrap_or_default(),
+        a.cs_sig.clone().unwrap_or_default(),
+    );
+    let (rp_id, origin) = (
+        a.cs_rp_id.clone().unwrap_or_default(),
+        a.cs_origin.clone().unwrap_or_default(),
+    );
+    let key_status = a.uk_status.clone().unwrap_or_default();
+    let valid = key_status != "revoked"
+        && webauthn::check_assertion(
+            &spki,
+            &crypto::approval_challenge(c.id, &a.role, &c.credential_hash),
+            &rp_id,
+            &origin,
+            &auth,
+            &client,
+            &sig,
+        )
+        .is_ok();
+    Some(PersonalView {
+        valid,
+        key_id,
+        fingerprint: hex::encode(&Sha256::digest(&spki)[..8]),
+        key_status,
+        public_key: webauthn::enc(&spki),
+        rp_id,
+        origin,
+        authenticator_data: webauthn::enc(&auth),
+        client_data_json: webauthn::enc(&client),
+        signature: webauthn::enc(&sig),
+    })
 }
 
 pub fn evaluate(c: &CredRow, rows: &[ApprovalRow]) -> Evaluation {
@@ -248,6 +328,7 @@ pub fn evaluate(c: &CredRow, rows: &[ApprovalRow]) -> Evaluation {
                 key_status: a.key_status.clone(),
                 public_key: a.public_key.clone(),
                 signed_at: a.signed_at,
+                personal: personal_view(c, a),
             })
             .collect(),
     }
@@ -259,7 +340,7 @@ pub fn verdict(c: &CredRow, ev: &Evaluation, t: Option<&Termination>) -> &'stati
     match (c.status.as_str(), t) {
         (_, Some(t)) if !t.valid => "INVALID",
         (_, Some(t)) if t.row.kind == "revoked" => "REVOKED",
-        (_, Some(_)) if ev.hash_ok && ev.order_ok && ev.sigs_ok() => "REJECTED",
+        (_, Some(_)) if ev.hash_ok && ev.order_ok && ev.sigs_ok() && ev.personal_ok() => "REJECTED",
         (_, Some(_)) => "INVALID",
         ("revoked" | "rejected", None) => "INVALID",
         _ if !ev.intact() => "INVALID",
@@ -422,7 +503,7 @@ fn full_view(c: &CredRow, ev: &Evaluation, t: Option<&Termination>) -> Value {
         "block_height": c.block_height, "leaf_index": c.leaf_index,
         "verdict": verdict(c, ev, t), "signatures": ev.sigs,
         "termination": t.map(|t| t.row.view(t.valid)),
-        "checks": { "hash_ok": ev.hash_ok, "order_ok": ev.order_ok, "status_ok": ev.status_ok, "signatures_ok": ev.sigs_ok(), "termination_ok": termination_ok(c, t) },
+        "checks": { "hash_ok": ev.hash_ok, "order_ok": ev.order_ok, "status_ok": ev.status_ok, "signatures_ok": ev.sigs_ok(), "personal_signatures_ok": ev.personal_ok(), "termination_ok": termination_ok(c, t) },
     })
 }
 
@@ -431,12 +512,20 @@ pub async fn get(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Res<Json<Value>> {
-    let c = load(&st, &user, id).await?;
-    let ev = evaluate(&c, &fetch_approvals(&st.db, id).await?);
-    let t = fetch_event(&st.db, id, &c).await?;
+    load(&st, &user, id).await?; // faculty only see their own credentials
+    let (c, ev, t) = load_core(&st, id).await?;
     let mut view = full_view(&c, &ev, t.as_ref());
     view["supersedes"] = json!(c.supersedes);
     view["superseded_by"] = json!(successor(&st, id).await?);
+    let approvers: Vec<(String, String)> = sqlx::query_as(
+        "SELECT a.role, u.email FROM approvals a JOIN users u ON u.id = a.approver_id WHERE a.credential_id = $1 ORDER BY a.signed_at",
+    )
+    .bind(id)
+    .fetch_all(&st.db)
+    .await?;
+    view["approvers"] = json!(approvers
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>());
     Ok(Json(view))
 }
 
@@ -505,11 +594,28 @@ async fn record_event(
     Ok(())
 }
 
+#[derive(Deserialize, Default)]
+struct ApproveBody {
+    /// The approver's personal signature over this approval (see `webauthn`).
+    webauthn: Option<webauthn::AssertionIn>,
+}
+
+/// An empty body means "no options"; anything else must be valid JSON.
+fn parse_body<T: serde::de::DeserializeOwned + Default>(body: &Bytes) -> Res<T> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(body)
+        .map_err(|e| AppError::BadRequest(format!("invalid request body: {e}")))
+}
+
 pub async fn approve(
     State(st): State<AppState>,
     user: AuthUser,
     Path(id): Path<Uuid>,
+    body: Bytes,
 ) -> Res<Json<Value>> {
+    let ApproveBody { webauthn: personal } = parse_body(&body)?;
     let mut tx = st.db.begin().await?;
     let c = lock(&mut tx, id).await?;
     let (stage, next) = next_stage(&c.status, user.role).ok_or_else(|| {
@@ -526,14 +632,31 @@ pub async fn approve(
             "integrity check failed on existing signatures; refusing to co-sign".into(),
         ));
     }
+    if st.cfg.require_personal {
+        if personal.is_none() {
+            return Err(AppError::Conflict(
+                "this deployment requires a personal signature (your security key) on every approval".into(),
+            ));
+        }
+        if prior.iter().any(|p| p.cs_key_id.is_none()) {
+            return Err(AppError::Conflict(
+                "an earlier approval still lacks its signer's personal signature; they must add it first".into(),
+            ));
+        }
+    }
     let (key_id, seed) = keys::active_signer(&st, stage).await?;
     let signature = crypto::sign(
         &seed,
         &crypto::approval_message(id, stage, &c.credential_hash),
     );
+    let approval_id = Uuid::new_v4();
     sqlx::query("INSERT INTO approvals (id, credential_id, role, approver_id, key_id, signature) VALUES ($1,$2,$3,$4,$5,$6)")
-        .bind(Uuid::new_v4()).bind(id).bind(stage).bind(user.id).bind(key_id).bind(signature)
+        .bind(approval_id).bind(id).bind(stage).bind(user.id).bind(key_id).bind(signature)
         .execute(&mut *tx).await?;
+    if let Some(a) = &personal {
+        let challenge = crypto::approval_challenge(id, stage, &c.credential_hash);
+        webauthn::countersign(&st, &mut tx, &user, approval_id, &challenge, a).await?;
+    }
     sqlx::query("UPDATE credentials SET status = $2 WHERE id = $1")
         .bind(id)
         .bind(next)
@@ -547,10 +670,105 @@ pub async fn approve(
         "CREDENTIAL_SIGNED",
         "credential",
         &id.to_string(),
-        json!({ "stage": stage, "status": next }),
+        json!({ "stage": stage, "status": next, "personal_signature": personal.is_some() }),
     )
     .await;
     Ok(Json(json!({ "id": id, "status": next })))
+}
+
+#[derive(Deserialize)]
+pub struct CountersignBody {
+    webauthn: webauthn::AssertionIn,
+}
+
+/// Adds the caller's personal signature to an approval they already made (for example the faculty member's
+/// own creation, which has no separate signing step).
+pub async fn countersign(
+    State(st): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+    Json(b): Json<CountersignBody>,
+) -> Res<Json<Value>> {
+    let mut tx = st.db.begin().await?;
+    let c = lock(&mut tx, id).await?;
+    let (approval_id, role) = unsigned_own_approval(&mut tx, id, user.id)
+        .await?
+        .ok_or_else(|| {
+            AppError::Conflict(
+                "you have no approval on this credential that still needs a personal signature"
+                    .into(),
+            )
+        })?;
+    let challenge = crypto::approval_challenge(id, &role, &c.credential_hash);
+    webauthn::countersign(&st, &mut tx, &user, approval_id, &challenge, &b.webauthn).await?;
+    tx.commit().await?;
+    audit::actor_log(
+        &st.db,
+        &user,
+        "APPROVAL_COUNTERSIGNED",
+        "credential",
+        &id.to_string(),
+        json!({ "stage": role }),
+    )
+    .await;
+    Ok(Json(json!({ "id": id, "stage": role })))
+}
+
+async fn unsigned_own_approval(
+    tx: &mut sqlx::PgConnection,
+    id: Uuid,
+    user_id: Uuid,
+) -> Res<Option<(Uuid, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT a.id, a.role FROM approvals a
+         LEFT JOIN approval_countersigs cs ON cs.approval_id = a.id
+         WHERE a.credential_id = $1 AND a.approver_id = $2 AND cs.approval_id IS NULL
+         ORDER BY a.signed_at LIMIT 1",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(tx)
+    .await?)
+}
+
+/// What the caller's authenticator should be asked to sign next on this credential, and with which keys.
+pub async fn personal_challenge(
+    State(st): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Res<Json<Value>> {
+    let c = load(&st, &user, id).await?;
+    let mut conn = st.db.acquire().await?;
+    let ended: Option<(String,)> =
+        sqlx::query_as("SELECT kind FROM credential_events WHERE credential_id = $1")
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let next = if ended.is_none() {
+        next_stage(&c.status, user.role).map(|(stage, _)| ("approve", stage.to_string()))
+    } else {
+        None
+    };
+    let (purpose, stage) = match next {
+        Some(n) => n,
+        None => match unsigned_own_approval(&mut conn, id, user.id).await? {
+            Some((_, role)) => ("countersign", role),
+            None => {
+                return Err(AppError::NotFound(
+                    "there is nothing for you to sign here".into(),
+                ))
+            }
+        },
+    };
+    let allow = webauthn::allowed_credentials(&st, user.id).await?;
+    Ok(Json(json!({
+        "purpose": purpose,
+        "stage": stage,
+        "challenge": webauthn::enc(&crypto::approval_challenge(id, &stage, &c.credential_hash)),
+        "rp_id": st.cfg.webauthn.rp_id,
+        "allow": allow,
+        "required": st.cfg.require_personal,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -711,29 +929,41 @@ pub struct Assessment {
     pub verdict: &'static str,
 }
 
-async fn assess(st: &AppState, c: &CredRow) -> Res<Assessment> {
-    let ev = evaluate(c, &fetch_approvals(&st.db, c.id).await?);
-    let term = fetch_event(&st.db, c.id, c).await?;
-    let anchor = crate::ledger::anchor_for(&st.db, c).await?;
-    let mut verdict = verdict(c, &ev, term.as_ref());
-    if verdict == "VALID" && anchor.as_ref().is_some_and(|a| !a.ok) {
-        verdict = "INVALID";
-    }
-    Ok(Assessment {
-        ev,
-        term,
-        anchor,
-        verdict,
-    })
-}
-
-async fn load_row(st: &AppState, id: Uuid) -> Res<CredRow> {
-    Ok(sqlx::query_as(&format!(
+/// Reads a credential, its approvals and its final event in ONE database snapshot. Without it, a verification
+/// racing an approval could read the old status next to the new approval and report a spurious INVALID.
+async fn load_core(st: &AppState, id: Uuid) -> Res<(CredRow, Evaluation, Option<Termination>)> {
+    let mut tx = st.db.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let c: CredRow = sqlx::query_as(&format!(
         "SELECT {CRED_COLS} FROM credentials WHERE id = $1"
     ))
     .bind(id)
-    .fetch_one(&st.db)
-    .await?)
+    .fetch_one(&mut *tx)
+    .await?;
+    let ev = evaluate(&c, &fetch_approvals(&mut *tx, id).await?);
+    let term = fetch_event(&mut *tx, id, &c).await?;
+    tx.commit().await?;
+    Ok((c, ev, term))
+}
+
+async fn assess(st: &AppState, id: Uuid) -> Res<(CredRow, Assessment)> {
+    let (c, ev, term) = load_core(st, id).await?;
+    let anchor = crate::ledger::anchor_for(&st.db, &c).await?;
+    let mut verdict = verdict(&c, &ev, term.as_ref());
+    if verdict == "VALID" && anchor.as_ref().is_some_and(|a| !a.ok) {
+        verdict = "INVALID";
+    }
+    Ok((
+        c,
+        Assessment {
+            ev,
+            term,
+            anchor,
+            verdict,
+        },
+    ))
 }
 
 /// The credential that replaced this one (the latest, if it was re-issued more than once) and its verdict.
@@ -747,8 +977,7 @@ async fn successor(st: &AppState, id: Uuid) -> Res<Option<Value>> {
     let Some((next,)) = next else {
         return Ok(None);
     };
-    let c = load_row(st, next).await?;
-    let a = assess(st, &c).await?;
+    let (c, a) = assess(st, next).await?;
     Ok(Some(
         json!({ "id": next, "verdict": a.verdict, "status": c.status }),
     ))
@@ -781,8 +1010,8 @@ pub async fn reissue(
     Json(b): Json<ReissueBody>,
 ) -> Res<(StatusCode, Json<Value>)> {
     user.require(&[Role::Faculty])?;
-    let old = load(&st, &user, id).await?;
-    let a = assess(&st, &old).await?;
+    load(&st, &user, id).await?; // faculty only see their own credentials
+    let (old, a) = assess(&st, id).await?;
     if !can_reissue(a.verdict) {
         return Err(AppError::Conflict(format!(
             "credential is {}; only a revoked, rejected or invalid credential can be re-issued",
@@ -863,13 +1092,15 @@ pub async fn verify(
     Path(id): Path<Uuid>,
     Query(q): Query<VerifyQuery>,
 ) -> Res<Json<Value>> {
-    let c = load_row(&st, id).await?;
-    let Assessment {
-        ev,
-        term: t,
-        anchor,
-        verdict,
-    } = assess(&st, &c).await?;
+    let (
+        c,
+        Assessment {
+            ev,
+            term: t,
+            anchor,
+            verdict,
+        },
+    ) = assess(&st, id).await?;
     let qr_match =
         q.h.as_deref()
             .filter(|h| h.len() >= 8)
@@ -886,7 +1117,7 @@ pub async fn verify(
         "supersedes": c.supersedes,
         "superseded_by": successor(&st, id).await?,
         "termination": t.as_ref().map(|t| t.row.view(t.valid)),
-        "checks": { "hash_ok": ev.hash_ok, "order_ok": ev.order_ok, "status_ok": ev.status_ok, "signatures_ok": ev.sigs_ok(), "termination_ok": termination_ok(&c, t.as_ref()) },
+        "checks": { "hash_ok": ev.hash_ok, "order_ok": ev.order_ok, "status_ok": ev.status_ok, "signatures_ok": ev.sigs_ok(), "personal_signatures_ok": ev.personal_ok(), "termination_ok": termination_ok(&c, t.as_ref()) },
         "signatures": ev.sigs,
         "anchor": anchor,
         "qr_hash_match": qr_match,

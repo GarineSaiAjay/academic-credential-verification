@@ -10,6 +10,7 @@ mod ledger;
 mod security;
 mod timestamp;
 mod users;
+mod webauthn;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -93,15 +94,29 @@ pub fn router(st: AppState) -> Router {
         .route("/api/v1/auth/me", get(auth::me))
         .route("/api/v1/credentials", get(credentials::list))
         .route("/api/v1/credentials/:id", get(credentials::get))
+        .route(
+            "/api/v1/credentials/:id/personal-challenge",
+            get(credentials::personal_challenge),
+        )
         .route("/api/v1/keys", get(keys::list))
         .route("/api/v1/ledger/blocks", get(ledger::blocks))
         .route("/api/v1/audit", get(audit::list))
-        .route("/api/v1/users", get(users::list));
+        .route("/api/v1/users", get(users::list))
+        .route("/api/v1/me/keys", get(webauthn::my_keys))
+        .route("/api/v1/users/:id/keys", get(webauthn::user_keys));
 
     let writes = Router::new()
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/password", post(users::change_password))
         .route("/api/v1/users", post(users::create))
+        .route("/api/v1/me/keys/options", post(webauthn::key_options))
+        .route("/api/v1/me/keys", post(webauthn::key_register))
+        .route(
+            "/api/v1/users/:id/keys/enroll",
+            post(webauthn::allow_enrollment),
+        )
+        .route("/api/v1/user-keys/:id/retire", post(webauthn::retire))
+        .route("/api/v1/user-keys/:id/revoke", post(webauthn::revoke))
         .route("/api/v1/users/:id/role", post(users::set_role))
         .route("/api/v1/users/:id/active", post(users::set_active))
         .route("/api/v1/users/:id/password", post(users::reset_password))
@@ -114,6 +129,10 @@ pub fn router(st: AppState) -> Router {
         .route(
             "/api/v1/credentials/:id/reissue",
             post(credentials::reissue),
+        )
+        .route(
+            "/api/v1/credentials/:id/countersign",
+            post(credentials::countersign),
         )
         .route("/api/v1/credentials/:id/revoke", post(credentials::revoke))
         .route("/api/v1/keys/:role/rotate", post(keys::rotate))

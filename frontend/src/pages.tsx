@@ -1,5 +1,6 @@
 import { FormEvent, ReactNode, useCallback, useEffect, useState } from 'react';
 import { api, ApiError, getSession, Role, setSession } from './api';
+import { Challenge, registerKey, sign as signWithKey, webauthnSupported } from './webauthn';
 
 export const go = (hash: string) => { window.location.hash = hash; };
 
@@ -126,12 +127,12 @@ export function NewCredential() {
   );
 }
 
-interface Sig { role: string; valid: boolean; key_status: string; public_key: string; signed_at: string }
+interface Sig { role: string; valid: boolean; key_status: string; public_key: string; signed_at: string; personal?: { valid: boolean; fingerprint: string; key_status: string } | null }
 
 function SigTable({ sigs }: { sigs: Sig[] }) {
   return (
     <table>
-      <thead><tr><th>Stage</th><th>Signature</th><th>Key</th><th>Public key</th><th>Signed</th></tr></thead>
+      <thead><tr><th>Stage</th><th>Signature</th><th>Key</th><th>Public key</th><th>Personal signature</th><th>Signed</th></tr></thead>
       <tbody>
         {sigs.map((s) => (
           <tr key={s.role}>
@@ -139,6 +140,7 @@ function SigTable({ sigs }: { sigs: Sig[] }) {
             <td className={s.valid ? 'good' : 'bad'}>{s.valid ? 'valid' : 'INVALID'}</td>
             <td className={s.key_status === 'revoked' ? 'bad' : ''}>{s.key_status}</td>
             <td className="mono">{short(s.public_key, 16)}…</td>
+            <td className={s.personal ? (s.personal.valid ? 'good' : 'bad') : 'muted'}>{s.personal ? (s.personal.valid ? `valid (key ${s.personal.fingerprint.slice(0, 8)})` : `INVALID (${s.personal.key_status} key ${s.personal.fingerprint.slice(0, 8)})`) : 'none'}</td>
             <td>{when(s.signed_at)}</td>
           </tr>
         ))}
@@ -154,6 +156,17 @@ export function CredDetail({ id, role }: { id: string; role: Role }) {
   const { run, banner } = useAction();
   const reason = (label: string) => window.prompt(label)?.trim() || null;
   const canSign = c && NEXT[c.status] === role;
+  // What this person's security key would be asked to sign here, if anything.
+  const [pc, setPc] = useState<Challenge | null>(null);
+  useEffect(() => {
+    api<Challenge>('GET', `/credentials/${id}/personal-challenge`).then(setPc).catch(() => setPc(null));
+  }, [id, c?.status, c?.signatures?.length, c?.signatures?.filter((x: any) => x.personal).length]);
+  const approve = async () => {
+    if (pc && pc.purpose === 'approve' && pc.allow.length > 0) return api('POST', `/credentials/${id}/approve`, { webauthn: await signWithKey(pc) });
+    if (pc?.required) throw new Error('This site requires your personal security-key signature. Add a key on your Account page first.');
+    return api('POST', `/credentials/${id}/approve`);
+  };
+  const countersign = async () => api('POST', `/credentials/${id}/countersign`, { webauthn: await signWithKey(pc as Challenge) });
   return (
     <div>
       {banner}<Err msg={error} />
@@ -174,7 +187,8 @@ export function CredDetail({ id, role }: { id: string; role: Role }) {
               {c.termination && <tr><th>Signed {c.termination.kind}</th><td className={c.termination.valid ? 'good' : 'bad'}>{c.termination.valid ? `signature valid (${c.termination.stage.replace('_', ' ')} key${c.termination.legacy ? ', added later for an older record' : ''})` : 'SIGNATURE INVALID'}</td></tr>}
             </tbody></table>
             <div className="toolbar">
-              {canSign && <button onClick={() => run(() => api('POST', `/credentials/${id}/approve`), 'Signed', reload)}>Sign as {role.replace('_', ' ')}</button>}
+              {canSign && <button onClick={() => run(approve, 'Signed', reload)}>Sign as {role.replace('_', ' ')}{pc?.purpose === 'approve' && pc.allow.length > 0 ? ' with my security key' : ''}</button>}
+              {pc?.purpose === 'countersign' && <button onClick={() => run(countersign, 'Personal signature added', reload)}>Add my personal signature ({pc.stage.replace('_', ' ')})</button>}
               {canSign && <button className="danger" onClick={() => { const r = reason('Reason for rejection'); r && run(() => api('POST', `/credentials/${id}/reject`, { reason: r }), 'Rejected', reload); }}>Reject</button>}
               {role === 'faculty' && ['REVOKED', 'REJECTED', 'INVALID'].includes(c.verdict) && (!c.superseded_by || ['rejected', 'revoked'].includes(c.superseded_by.status)) && <button onClick={() => window.confirm('Create a new credential from this one? It goes through every approval stage again.') && run(() => api<{ id: string }>('POST', `/credentials/${id}/reissue`, {}).then((r) => go(`/c/${r.id}`)), 'Re-issued')}>Re-issue</button>}
               {role === 'university_admin' && c.status === 'issued' && <button className="danger" onClick={() => { const r = reason('Reason for revocation'); r && run(() => api('POST', `/credentials/${id}/revoke`, { reason: r }), 'Revoked', reload); }}>Revoke</button>}
@@ -369,6 +383,7 @@ export function Users({ me }: { me: string }) {
                   <td>
                     {!self && (
                       <>
+                        <button className="small" title="Lets this person enrol a security key without an existing one, for 24 hours" onClick={() => window.confirm(`Allow ${u.email} to enrol a new security key for the next 24 hours?`) && run(() => api('POST', `/users/${u.id}/keys/enroll`), `${u.email} may enrol a key`)}>Allow key enrolment</button>{' '}
                         <button className="small" onClick={() => { const p = window.prompt(`New password for ${u.email} (12-128 characters). They will be signed out everywhere.`); p && run(() => api('POST', `/users/${u.id}/password`, { password: p }), `Password reset for ${u.email}`, reload); }}>Reset password</button>{' '}
                         <button className={u.active ? 'danger small' : 'small'} onClick={() => (!u.active || window.confirm(`Deactivate ${u.email}? They are signed out immediately.`)) && run(() => api('POST', `/users/${u.id}/active`, { active: !u.active }), `${u.email} ${u.active ? 'deactivated' : 'activated'}`, reload)}>{u.active ? 'Deactivate' : 'Activate'}</button>
                       </>
@@ -396,6 +411,41 @@ export function Users({ me }: { me: string }) {
   );
 }
 
+function MyKeys() {
+  const { data, error, reload } = useLoad<{ keys: any[] }>('/me/keys');
+  const { run, banner } = useAction();
+  const [label, setLabel] = useState('');
+  return (
+    <Card title="My security keys">
+      {banner}<Err msg={error} />
+      <p className="muted">A security key or passkey lets you sign approvals personally. Its private half never leaves your device, so nobody, including this server, can sign as you.</p>
+      <table>
+        <thead><tr><th>Name</th><th>Status</th><th>Fingerprint</th><th>Added</th><th /></tr></thead>
+        <tbody>
+          {data?.keys.map((k) => (
+            <tr key={k.id}>
+              <td>{k.label}</td>
+              <td className={k.status === 'active' ? 'good' : k.status === 'revoked' ? 'bad' : 'muted'}>{k.status}{k.end_reason ? ` (${k.end_reason})` : ''}</td>
+              <td className="mono">{k.fingerprint}</td>
+              <td>{when(k.created_at)}</td>
+              <td>
+                {k.status === 'active' && <button className="small" onClick={() => window.confirm('Retire this key? It can no longer sign; what it signed stays valid.') && run(() => api('POST', `/user-keys/${k.id}/retire`), 'Key retired', reload)}>Retire</button>}{' '}
+                {k.status !== 'revoked' && <button className="danger small" onClick={() => { const r = window.prompt('Why is this key compromised? Everything it signed will stop verifying.')?.trim(); r && run(() => api('POST', `/user-keys/${k.id}/revoke`, { reason: r }), 'Key revoked', reload); }}>Report compromised</button>}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {webauthnSupported() ? (
+        <form className="form" onSubmit={(e) => { e.preventDefault(); run(() => registerKey(label.trim()), 'Key added', () => { setLabel(''); reload(); }); }}>
+          <label>Name for the new key (for example "YubiKey" or "laptop")<input value={label} onChange={(e) => setLabel(e.target.value)} maxLength={80} required /></label>
+          <button>Add a security key / passkey</button>
+        </form>
+      ) : <p className="muted">This browser or connection cannot use security keys. Open the site over HTTPS in a current browser.</p>}
+    </Card>
+  );
+}
+
 export function Account() {
   const [form, setForm] = useState({ current_password: '', new_password: '' });
   const [busy, setBusy] = useState(false);
@@ -407,6 +457,8 @@ export function Account() {
     setBusy(false);
   };
   return (
+    <>
+    <MyKeys />
     <Card title="Change password">
       {banner}
       <form onSubmit={submit} className="form">
@@ -415,6 +467,7 @@ export function Account() {
         <button disabled={busy}>{busy ? 'Saving...' : 'Change password'}</button>
       </form>
     </Card>
+    </>
   );
 }
 
