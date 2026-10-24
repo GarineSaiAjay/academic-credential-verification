@@ -75,9 +75,11 @@ pub async fn verify_stored_keys(st: &AppState) -> Res<()> {
         .map(|(role, _, _)| role.as_str())
         .collect();
     if bad.is_empty() {
-        let blobs: Vec<(Vec<u8>,)> = sqlx::query_as("SELECT private_key_enc FROM signing_keys")
-            .fetch_all(&st.db)
-            .await?;
+        let blobs: Vec<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT private_key_enc FROM signing_keys UNION ALL SELECT secret_enc FROM user_totp",
+        )
+        .fetch_all(&st.db)
+        .await?;
         let old = blobs
             .iter()
             .filter(|(b,)| !st.cfg.enc_key.is_current(b))
@@ -86,7 +88,7 @@ pub async fn verify_stored_keys(st: &AppState) -> Res<()> {
             tracing::warn!(
                 keys = old,
                 current = %st.cfg.enc_key.current_id(),
-                "some signing keys are not encrypted under the current ENCRYPTION_KEY; run `server key-rewrap` (rotation)"
+                "some stored keys or two-factor secrets are not encrypted under the current ENCRYPTION_KEY; run `server key-rewrap` (rotation)"
             );
         }
         return Ok(());
@@ -139,6 +141,29 @@ pub async fn rewrap(
         sqlx::query("UPDATE signing_keys SET private_key_enc = $2 WHERE id = $1")
             .bind(id)
             .bind(ring.seal(&seed))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        report.rewrapped += 1;
+    }
+    // Two-factor secrets are sealed with the same ring and must move with the signing keys, or dropping the
+    // old key would lock those people out.
+    let secrets: Vec<(Uuid, Vec<u8>)> =
+        sqlx::query_as("SELECT user_id, secret_enc FROM user_totp ORDER BY user_id FOR UPDATE")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    for (user, blob) in secrets {
+        if ring.is_current(&blob) {
+            report.already_current += 1;
+            continue;
+        }
+        let plain = ring.open(&blob).ok_or_else(|| {
+            format!("cannot decrypt the two-factor secret of user {user} with ENCRYPTION_KEY or ENCRYPTION_KEY_PREVIOUS; nothing was changed")
+        })?;
+        sqlx::query("UPDATE user_totp SET secret_enc = $2 WHERE user_id = $1")
+            .bind(user)
+            .bind(ring.seal(&plain))
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;

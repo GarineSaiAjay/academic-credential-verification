@@ -1,5 +1,5 @@
 export type Role = 'faculty' | 'exam_cell' | 'registrar' | 'university_admin' | 'auditor';
-export interface Session { token: string; email: string; role: Role }
+export interface Session { token: string; email: string; role: Role; mfaSetup?: boolean }
 
 const KEY = 'acvs.session';
 let session: Session | null = null;

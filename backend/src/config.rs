@@ -1,6 +1,6 @@
 use std::{env, net::IpAddr, path::PathBuf, time::Duration};
 
-use crate::crypto::KeyRing;
+use crate::{auth::Role, crypto::KeyRing};
 
 /// External RFC 3161 time-stamping authority that every sealed block is anchored to.
 #[derive(Clone)]
@@ -52,6 +52,8 @@ pub struct Config {
     pub require_personal: bool,
     /// Even a person's first key needs an administrator to open the enrolment window.
     pub require_admin_enrollment: bool,
+    /// Roles that must sign in with a second factor; without one set up they can do nothing but set it up.
+    pub require_mfa_roles: Vec<Role>,
 }
 
 /// An address range such as `172.29.250.0/24`; a bare address is a range of one.
@@ -104,6 +106,20 @@ impl Cidr {
             _ => false,
         }
     }
+}
+
+fn mfa_roles() -> Result<Vec<Role>, String> {
+    optional("REQUIRE_MFA_ROLES")
+        .map(|l| {
+            l.split(',')
+                .map(|r| {
+                    Role::parse(r.trim()).ok_or_else(|| {
+                        format!("REQUIRE_MFA_ROLES: '{}' is not a role (faculty, exam_cell, registrar, university_admin, auditor)", r.trim())
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
 }
 
 fn trusted_proxies() -> Result<Vec<Cidr>, String> {
@@ -242,6 +258,7 @@ impl Config {
             login_account_window_secs: bounded("LOGIN_ACCOUNT_WINDOW_SECS", 900, 10, 86_400)?,
         };
         let trusted_proxies = trusted_proxies()?;
+        let require_mfa_roles = mfa_roles()?;
         let webauthn = webauthn_config(&public_base_url, optional("WEBAUTHN_RP_ID"))?;
         Ok(Self {
             database_url: required("DATABASE_URL")?,
@@ -258,6 +275,7 @@ impl Config {
             require_personal: optional("REQUIRE_PERSONAL_SIGNATURES").is_some_and(|v| v == "true"),
             require_admin_enrollment: optional("REQUIRE_ADMIN_ENROLLMENT")
                 .is_some_and(|v| v == "true"),
+            require_mfa_roles,
         })
     }
 }

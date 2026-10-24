@@ -300,14 +300,22 @@ pub const USAGE: &str = "usage:
   server key-rewrap [--dry-run]  re-encrypt every stored signing key under the current ENCRYPTION_KEY
                                  (rotation: set the new key as ENCRYPTION_KEY and the old one in
                                  ENCRYPTION_KEY_PREVIOUS, run this, then remove ENCRYPTION_KEY_PREVIOUS)
+  server totp-reset EMAIL        remove a user's two-factor sign-in and end their sessions (when no administrator can sign in)
 key-backup and key-restore take the passphrase from the KEY_BACKUP_PASSPHRASE environment variable";
 
 pub fn is_command(arg: &str) -> bool {
-    matches!(arg, "key-backup" | "key-restore" | "key-rewrap")
+    matches!(
+        arg,
+        "key-backup" | "key-restore" | "key-rewrap" | "totp-reset"
+    )
 }
 
 pub async fn cli(db: &PgPool, ring: &KeyRing, args: &[String]) -> R<()> {
     let dry_run = args.iter().any(|a| a == "--dry-run");
+    if args[0] == "totp-reset" {
+        let email = args.get(1).ok_or("usage: server totp-reset EMAIL")?;
+        return crate::totp::cli_reset(db, email).await;
+    }
     if args[0] == "key-rewrap" {
         let r = keys::rewrap(db, ring, dry_run).await?;
         let verb = if dry_run { "would be " } else { "" };

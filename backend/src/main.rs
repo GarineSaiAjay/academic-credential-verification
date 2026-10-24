@@ -7,8 +7,11 @@ mod error;
 mod keybackup;
 mod keys;
 mod ledger;
+mod reset;
 mod security;
+mod sessions;
 mod timestamp;
+mod totp;
 mod users;
 mod webauthn;
 
@@ -77,6 +80,8 @@ pub fn router(st: AppState) -> Router {
     let public = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/api/v1/auth/login", post(auth::login))
+        .route("/api/v1/auth/reset-password", post(reset::redeem))
+        .route("/api/v1/auth/login/mfa", post(totp::login))
         .route("/api/v1/verify/:id", get(credentials::verify))
         .route("/api/v1/credentials/:id/qr", get(credentials::qr))
         .route("/api/v1/ledger/verify", get(ledger::verify_chain))
@@ -95,6 +100,8 @@ pub fn router(st: AppState) -> Router {
 
     let reads = Router::new()
         .route("/api/v1/auth/me", get(auth::me))
+        .route("/api/v1/auth/sessions", get(sessions::list))
+        .route("/api/v1/auth/totp", get(totp::status))
         .route("/api/v1/credentials", get(credentials::list))
         .route("/api/v1/credentials/:id", get(credentials::get))
         .route(
@@ -110,6 +117,24 @@ pub fn router(st: AppState) -> Router {
 
     let writes = Router::new()
         .route("/api/v1/auth/logout", post(auth::logout))
+        .route(
+            "/api/v1/auth/sessions/revoke-others",
+            post(sessions::revoke_others),
+        )
+        .route("/api/v1/auth/sessions/:id/revoke", post(sessions::revoke))
+        .route(
+            "/api/v1/users/:id/sessions/revoke",
+            post(sessions::revoke_user),
+        )
+        .route("/api/v1/users/:id/reset-link", post(reset::issue))
+        .route("/api/v1/auth/totp/setup", post(totp::setup))
+        .route("/api/v1/auth/totp/enable", post(totp::enable))
+        .route("/api/v1/auth/totp/disable", post(totp::disable))
+        .route(
+            "/api/v1/auth/totp/recovery-codes",
+            post(totp::regenerate_codes),
+        )
+        .route("/api/v1/users/:id/totp/reset", post(totp::admin_reset))
         .route("/api/v1/auth/password", post(users::change_password))
         .route("/api/v1/users", post(users::create))
         .route("/api/v1/me/keys/options", post(webauthn::key_options))
@@ -229,6 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ts_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     tokio::spawn(security::cleanup_forever(st.db.clone()));
+    tokio::spawn(sessions::purge_forever(st.db.clone()));
     // Instances started together (replicas, a rolling restart) must not race to create the first keys and
     // users: whoever holds this lock initialises, the others wait and then find it done. The lock lives as
     // long as this transaction, so it is released even if initialisation fails.

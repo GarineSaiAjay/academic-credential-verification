@@ -13,6 +13,7 @@ use axum::{
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::{
     auth::{self, client_ip},
@@ -122,39 +123,66 @@ pub fn account_key(email: &str) -> String {
     format!("acct:{}", hex::encode(&digest[..16]))
 }
 
-/// If this account has used up its failed-login budget, how many seconds until it may try again.
-pub async fn account_blocked(st: &AppState, email: &str) -> Option<u64> {
-    let rate = &st.cfg.rate;
-    let window = rate.login_account_window_secs;
+/// If `key` has used up a budget of `limit` failures per `window` seconds, how long until it may try again.
+/// Reading does not count as a failure; only `record_failure` does.
+async fn failures_exhausted(st: &AppState, key: &str, limit: u32, window: u64) -> Option<u64> {
     let row = sqlx::query_as::<_, (i32, i64, i64)>(
         "SELECT hits, window_start, floor(extract(epoch FROM now()))::bigint FROM rate_limits
          WHERE key = $1 AND window_start = (floor(extract(epoch FROM now()) / $2) * $2)::bigint",
     )
-    .bind(account_key(email))
+    .bind(key)
     .bind(window as f64)
     .fetch_optional(&st.db);
-    // If the database is slow the login proceeds (and fails on its own if the database is really down).
+    // If the database is slow the attempt proceeds (and fails on its own if the database is really down).
     match tokio::time::timeout(SHARED_TIMEOUT, row).await {
-        Ok(Ok(Some((hits, start, now)))) if hits >= rate.login_account_failures as i32 => {
+        Ok(Ok(Some((hits, start, now)))) if hits >= limit as i32 => {
             Some(retry_after(start, window, now))
         }
         _ => None,
     }
 }
 
-/// Records one failed login against an account.
-pub async fn account_failure(st: &AppState, email: &str) {
-    let window = st.cfg.rate.login_account_window_secs;
-    match tokio::time::timeout(
-        SHARED_TIMEOUT,
-        shared_hit(&st.db, &account_key(email), window),
+async fn record_failure(st: &AppState, key: &str, window: u64) {
+    match tokio::time::timeout(SHARED_TIMEOUT, shared_hit(&st.db, key, window)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "could not record a failed attempt"),
+        Err(_) => tracing::warn!("recording a failed attempt timed out"),
+    }
+}
+
+/// If this account has used up its failed-login budget, how many seconds until it may try again.
+pub async fn account_blocked(st: &AppState, email: &str) -> Option<u64> {
+    let rate = &st.cfg.rate;
+    failures_exhausted(
+        st,
+        &account_key(email),
+        rate.login_account_failures,
+        rate.login_account_window_secs,
     )
     .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(error = %e, "could not record a failed login"),
-        Err(_) => tracing::warn!("recording a failed login timed out"),
-    }
+}
+
+/// Records one failed login against an account.
+pub async fn account_failure(st: &AppState, email: &str) {
+    record_failure(
+        st,
+        &account_key(email),
+        st.cfg.rate.login_account_window_secs,
+    )
+    .await;
+}
+
+/// Second-factor codes have only a million values, so wrong ones are limited much harder than passwords:
+/// five per user per five minutes. Correct codes do not count.
+const MFA_FAILURES: u32 = 5;
+const MFA_WINDOW_SECS: u64 = 300;
+
+pub async fn mfa_blocked(st: &AppState, user: Uuid) -> Option<u64> {
+    failures_exhausted(st, &format!("mfa:{user}"), MFA_FAILURES, MFA_WINDOW_SECS).await
+}
+
+pub async fn mfa_failure(st: &AppState, user: Uuid) {
+    record_failure(st, &format!("mfa:{user}"), MFA_WINDOW_SECS).await;
 }
 
 /// Deletes counters whose window ended long ago, now and then.

@@ -45,12 +45,17 @@ cli() { dc run --rm -T backend ./server "$@" 2>&1; }
 
 echo "== a normal start"
 export SEED_DEMO_PASSWORD=$PASS
+dc build backend >/dev/null 2>&1 || { echo "FAIL: build"; exit 1; }
 start_with "$K1" || { echo "FAIL: stack did not start"; exit 1; }
 dc up -d --wait >/dev/null 2>&1
 FAC=$(login faculty); EXC=$(login examcell); REG=$(login registrar); ADM=$(login admin)
 C1=$(issue); expect "a credential is issued" "$(verdict "$C1")" VALID
 ID1=$(kid "$K1"); ID2=$(kid "$K2")
 H=$(headers); [ "$(echo "$H" | tr ' ' '\n' | grep -c "ac01$ID1")" = 4 ] && ok "all four keys are sealed under key $ID1 (self-describing header)" || bad "headers: $H"
+
+call POST /auth/totp/setup "$FAC" "{\"password\":\"$PASS\"}"; TSEC=$(echo "$BODY" | j "d['secret']")
+call POST /auth/totp/enable "$FAC" "{\"code\":\"$(python3 scripts/totp.py "$TSEC")\"}"; expect "a user turns on two-factor sign-in" "$CODE" 200
+expect "its secret is sealed under key $ID1 too" "$(DBX "SELECT encode(substring(secret_enc from 3 for 8),'hex') FROM user_totp")" "$ID1"
 
 echo "== data from before the header existed still works"
 DBX "UPDATE signing_keys SET private_key_enc = substring(private_key_enc from 11) WHERE role = 'registrar'" >/dev/null
@@ -79,11 +84,15 @@ OUT=$(ENCRYPTION_KEY=$K2 ENCRYPTION_KEY_PREVIOUS=$K1 cli key-rewrap); echo "$OUT
 H=$(headers); [ "$(echo "$H" | tr ' ' '\n' | grep -c "ac01$ID2")" = "$(echo "$H" | wc -w | tr -d " ")" ] && ok "every key, including the old-layout and retired ones, is in the new layout under the new key" || bad "headers after rewrap: $H"
 OUT=$(ENCRYPTION_KEY=$K2 ENCRYPTION_KEY_PREVIOUS=$K1 cli key-rewrap); echo "$OUT" | grep -q '^0 key(s) re-encrypted' && ok "running it again changes nothing" || bad "second run: $OUT"
 
+expect "the two-factor secret moved to the new key as well" "$(DBX "SELECT encode(substring(secret_enc from 3 for 8),'hex') FROM user_totp")" "$ID2"
+
 echo "== dropping the old key"
 start_with "$K2" && ok "the server starts with only the new key" || bad "did not start with only the new key"
 logs | grep -q 'not encrypted under the current ENCRYPTION_KEY' && bad "still warns after the rewrap" || ok "and no longer warns"
 expect "old credentials verify" "$(verdict "$C1")" VALID
 C5=$(issue); expect "new credentials are issued" "$(verdict "$C5")" VALID
+call POST /auth/login "" "{\"email\":\"faculty@university.edu\",\"password\":\"$PASS\"}"; MT=$(echo "$BODY" | j "d['mfa_token']")
+call POST /auth/login/mfa "" "{\"mfa_token\":\"$MT\",\"code\":\"$(python3 scripts/totp.py "$TSEC" 1)\"}"; expect "and that user still signs in with a code, with only the new key loaded" "$CODE" 200
 start_with "$K1"; rc=$?
 [ $rc -ne 0 ] && ok "the old key no longer opens anything (it can be destroyed)" || bad "the old key still works"
 start_with "$K2" || bad "could not restore the new key"

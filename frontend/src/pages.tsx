@@ -40,27 +40,81 @@ const Card = ({ title, children }: { title: string; children: ReactNode }) => (
 export function Login() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [code, setCode] = useState('');
+  const [mfaToken, setMfaToken] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  type LoginResult = { token?: string; email: string; role: Role; mfa_required?: boolean; mfa_token?: string; mfa_setup_required?: boolean };
+  const done = (r: LoginResult) => {
+    setSession({ token: r.token!, email: r.email, role: r.role, mfaSetup: !!r.mfa_setup_required });
+    go(r.mfa_setup_required ? '/account' : '/');
+  };
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     setBusy(true); setError('');
     try {
-      const r = await api<{ token: string; email: string; role: Role }>('POST', '/auth/login', { email, password });
-      setSession({ token: r.token, email: r.email, role: r.role });
-      go('/');
-    } catch (err) { setError((err as Error).message); }
+      if (mfaToken) {
+        done(await api<LoginResult>('POST', '/auth/login/mfa', { mfa_token: mfaToken, code: code.trim() }));
+      } else {
+        const r = await api<LoginResult>('POST', '/auth/login', { email, password });
+        if (r.mfa_required) { setMfaToken(r.mfa_token!); setPassword(''); } else done(r);
+      }
+    } catch (err) {
+      setError((err as Error).message);
+      // The interim sign-in lasts five minutes; once it is gone the password has to be entered again.
+      if (mfaToken && err instanceof ApiError && err.status === 401 && /expired/.test(err.message)) { setMfaToken(''); setCode(''); }
+    }
     setBusy(false);
   };
   return (
     <Card title="Sign in">
       <Err msg={error} />
       <form onSubmit={submit} className="form">
-        <label>Email<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required autoFocus /></label>
-        <label>Password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required /></label>
-        <button disabled={busy}>{busy ? 'Signing in...' : 'Sign in'}</button>
+        {mfaToken ? (
+          <>
+            <p className="muted">Enter the 6-digit code from your authenticator app, or one of your recovery codes.</p>
+            <label>Code<input value={code} onChange={(e) => setCode(e.target.value)} required autoFocus autoComplete="one-time-code" inputMode="text" /></label>
+            <button disabled={busy}>{busy ? 'Checking...' : 'Sign in'}</button>{' '}
+            <button type="button" className="small" onClick={() => { setMfaToken(''); setCode(''); setError(''); }}>Back</button>
+          </>
+        ) : (
+          <>
+            <label>Email<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required autoFocus /></label>
+            <label>Password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required /></label>
+            <button disabled={busy}>{busy ? 'Signing in...' : 'Sign in'}</button>
+          </>
+        )}
       </form>
+      <p className="muted">Forgot your password? Ask a university administrator for a one-time reset link.</p>
       <p className="muted">Verifying a credential does not need an account: <a href="#/verify">verify by ID</a>.</p>
+    </Card>
+  );
+}
+
+export function ResetPassword({ token }: { token: string }) {
+  const [pw, setPw] = useState('');
+  const [again, setAgain] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [doneFor, setDoneFor] = useState('');
+  const { run, banner } = useAction();
+  if (doneFor) return <Card title="Password changed"><p>The password for {doneFor} was changed and every session was signed out. <a href="#/login">Sign in</a>.</p></Card>;
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (pw !== again) { await run(() => Promise.reject(new Error('the two passwords differ')), ''); return; }
+    setBusy(true);
+    await run(async () => { const r = await api<{ email: string }>('POST', '/auth/reset-password', { token, new_password: pw }); setDoneFor(r.email); }, '');
+    setBusy(false);
+  };
+  return (
+    <Card title="Choose a new password">
+      {banner}
+      {!token && <div className="notice err">This page needs the link an administrator gave you.</div>}
+      <form onSubmit={submit} className="form">
+        <label>New password (12-128 characters)<input type="password" value={pw} onChange={(e) => setPw(e.target.value)} minLength={12} maxLength={128} required autoComplete="new-password" autoFocus /></label>
+        <label>Again<input type="password" value={again} onChange={(e) => setAgain(e.target.value)} required autoComplete="new-password" /></label>
+        <button disabled={busy || !token}>{busy ? 'Saving...' : 'Set password'}</button>
+      </form>
+      <p className="muted">If you use an authenticator app, you will still need your code to sign in.</p>
     </Card>
   );
 }
@@ -366,7 +420,7 @@ export function Users({ me }: { me: string }) {
       <Card title="Users">
         {banner}<Err msg={error} />
         <table>
-          <thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Created</th><th /></tr></thead>
+          <thead><tr><th>Email</th><th>Role</th><th>Status</th><th>2FA</th><th>Created</th><th /></tr></thead>
           <tbody>
             {data?.users.map((u) => {
               const self = u.email === me;
@@ -379,10 +433,14 @@ export function Users({ me }: { me: string }) {
                     </select>
                   </td>
                   <td className={u.active ? 'good' : 'bad'}>{u.active ? 'active' : 'deactivated'}</td>
+                  <td className={u.two_factor ? 'good' : 'muted'}>{u.two_factor ? 'on' : 'off'}</td>
                   <td>{when(u.created_at)}</td>
                   <td>
                     {!self && (
                       <>
+                        <button className="small" title="A one-time link, valid for an hour, that lets this person choose a new password" onClick={() => run(async () => { const r = await api<{ path: string }>('POST', `/users/${u.id}/reset-link`); window.prompt(`Give ${u.email} this link. It works once, for one hour. Copy it now; it is not shown again.`, `${window.location.origin}${r.path}`); }, `Reset link issued for ${u.email}`)}>Reset link</button>{' '}
+                        <button className="small" onClick={() => window.confirm(`Sign ${u.email} out of every device?`) && run(() => api('POST', `/users/${u.id}/sessions/revoke`), `Signed out ${u.email} everywhere`)}>Sign out everywhere</button>{' '}
+                        {u.two_factor && <><button className="small" title="For a lost phone: removes their second factor and signs them out" onClick={() => window.confirm(`Remove two-factor sign-in for ${u.email}? They are signed out everywhere.`) && run(() => api('POST', `/users/${u.id}/totp/reset`), `Two-factor sign-in removed for ${u.email}`, reload)}>Reset 2FA</button>{' '}</>}
                         <button className="small" title="Lets this person enrol a security key without an existing one, for 24 hours" onClick={() => window.confirm(`Allow ${u.email} to enrol a new security key for the next 24 hours?`) && run(() => api('POST', `/users/${u.id}/keys/enroll`), `${u.email} may enrol a key`)}>Allow key enrolment</button>{' '}
                         <button className="small" onClick={() => { const p = window.prompt(`New password for ${u.email} (12-128 characters). They will be signed out everywhere.`); p && run(() => api('POST', `/users/${u.id}/password`, { password: p }), `Password reset for ${u.email}`, reload); }}>Reset password</button>{' '}
                         <button className={u.active ? 'danger small' : 'small'} onClick={() => (!u.active || window.confirm(`Deactivate ${u.email}? They are signed out immediately.`)) && run(() => api('POST', `/users/${u.id}/active`, { active: !u.active }), `${u.email} ${u.active ? 'deactivated' : 'activated'}`, reload)}>{u.active ? 'Deactivate' : 'Activate'}</button>
@@ -446,7 +504,88 @@ function MyKeys() {
   );
 }
 
-export function Account() {
+function TwoFactor({ setupRequired }: { setupRequired: boolean }) {
+  const { data, error, reload } = useLoad<{ enabled: boolean; recovery_codes_left: number; required: boolean }>('/auth/totp');
+  const { run, banner } = useAction();
+  const [password, setPassword] = useState('');
+  const [code, setCode] = useState('');
+  const [setup, setSetup] = useState<{ secret: string; qr: string } | null>(null);
+  const [codes, setCodes] = useState<string[] | null>(null);
+  const reset = () => { setPassword(''); setCode(''); setSetup(null); };
+  // Turning it on lifts the "set this up first" restriction from the session that did it.
+  const unlock = () => { const s = getSession(); if (s?.mfaSetup) setSession({ ...s, mfaSetup: false }); };
+  return (
+    <Card title="Two-factor sign-in">
+      {banner}<Err msg={error} />
+      {setupRequired && <div className="notice err">Your role must sign in with a second factor. Set it up below to continue.</div>}
+      {data && !data.enabled && !setup && (
+        <form className="form" onSubmit={(e) => { e.preventDefault(); run(async () => setSetup(await api('POST', '/auth/totp/setup', { password })), 'Scan the code with your authenticator app, then enter a code it shows.'); }}>
+          <p className="muted">Adds a 6-digit code from an authenticator app (Google Authenticator, Authy, 1Password, ...) to signing in.</p>
+          <label>Your password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required autoComplete="current-password" /></label>
+          <button>Set up</button>
+        </form>
+      )}
+      {setup && (
+        <form className="form" onSubmit={(e) => { e.preventDefault(); run(async () => { const r = await api<{ recovery_codes: string[] }>('POST', '/auth/totp/enable', { code }); setCodes(r.recovery_codes); unlock(); reset(); reload(); }, 'Two-factor sign-in is on. Your other sessions were signed out.'); }}>
+          <img src={setup.qr} alt="QR code for your authenticator app" width={200} height={200} />
+          <p className="muted">Cannot scan it? Enter this key in the app: <span className="mono">{setup.secret}</span></p>
+          <label>Code from the app<input value={code} onChange={(e) => setCode(e.target.value)} required inputMode="numeric" autoComplete="one-time-code" /></label>
+          <button>Turn on</button>{' '}<button type="button" className="small" onClick={reset}>Cancel</button>
+        </form>
+      )}
+      {codes && (
+        <div className="notice ok">
+          <strong>Recovery codes.</strong> Each works once if you lose your phone. They are shown only now: save them somewhere safe.
+          <pre className="mono">{codes.join('\n')}</pre>
+          <button className="small" onClick={() => setCodes(null)}>I have saved them</button>
+        </div>
+      )}
+      {data?.enabled && !setup && (
+        <>
+          <p>Two-factor sign-in is <span className="good">on</span>. {data.recovery_codes_left} recovery code(s) left.</p>
+          <form className="form" onSubmit={(e) => e.preventDefault()}>
+            <label>Your password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" /></label>
+            <label>A current code (or a recovery code)<input value={code} onChange={(e) => setCode(e.target.value)} autoComplete="one-time-code" /></label>
+            <div>
+              <button type="button" className="small" onClick={() => run(async () => { const r = await api<{ recovery_codes: string[] }>('POST', '/auth/totp/recovery-codes', { password, code }); setCodes(r.recovery_codes); setPassword(''); setCode(''); reload(); }, 'New recovery codes issued; the old ones no longer work.')}>New recovery codes</button>{' '}
+              {data.required
+                ? <span className="muted">Your role requires it, so it cannot be turned off here. If you lose your device, ask an administrator to reset it.</span>
+                : <button type="button" className="danger small" onClick={() => window.confirm('Turn off two-factor sign-in?') && run(() => api('POST', '/auth/totp/disable', { password, code }), 'Two-factor sign-in is off.', () => { reset(); reload(); })}>Turn off</button>}
+            </div>
+          </form>
+        </>
+      )}
+    </Card>
+  );
+}
+
+function Sessions() {
+  const { data, error, reload } = useLoad<{ sessions: { id: string; created_at: string; expires_at: string; ip: string | null; user_agent: string | null; current: boolean }[] }>('/auth/sessions');
+  const { run, banner } = useAction();
+  const others = (data?.sessions.length ?? 0) > 1;
+  return (
+    <Card title="Where you are signed in">
+      {banner}<Err msg={error} />
+      <table>
+        <thead><tr><th>Device</th><th>Address</th><th>Signed in</th><th>Expires</th><th /></tr></thead>
+        <tbody>
+          {data?.sessions.map((x) => (
+            <tr key={x.id}>
+              <td>{x.user_agent || 'unknown'}{x.current && <span className="good"> (this one)</span>}</td>
+              <td className="mono">{x.ip ?? ''}</td>
+              <td>{when(x.created_at)}</td>
+              <td>{when(x.expires_at)}</td>
+              <td>{!x.current && <button className="small" onClick={() => run(() => api('POST', `/auth/sessions/${x.id}/revoke`), 'Session ended', reload)}>Sign out</button>}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {others && <p><button className="danger small" onClick={() => window.confirm('Sign out of every other device?') && run(() => api('POST', '/auth/sessions/revoke-others'), 'Signed out everywhere else', reload)}>Sign out everywhere else</button></p>}
+    </Card>
+  );
+}
+
+export function Account({ setupRequired = false }: { setupRequired?: boolean }) {
   const [form, setForm] = useState({ current_password: '', new_password: '' });
   const [busy, setBusy] = useState(false);
   const { run, banner } = useAction();
@@ -458,7 +597,9 @@ export function Account() {
   };
   return (
     <>
-    <MyKeys />
+    <TwoFactor setupRequired={setupRequired} />
+    {!setupRequired && <MyKeys />}
+    {!setupRequired && <Sessions />}
     <Card title="Change password">
       {banner}
       <form onSubmit={submit} className="form">

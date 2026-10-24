@@ -100,6 +100,16 @@ attack payloads blocked, forged headers ignored) and runs the whole smoke suite 
 It does not talk to Let's Encrypt, so first-time issuance on your real domain is the one thing it cannot prove: watch
 `docker compose -f docker-compose.prod.yml logs edge` on first start.
 
+## Accounts, sessions and two-factor sign-in
+
+**Sessions.** Every sign-in is a server-side session. *Account → Where you are signed in* lists your live sessions (device, address, time) and signs out any of them or all the others; an administrator can sign a user out everywhere from the Users page. Sessions that expired or were revoked more than a week ago are deleted automatically. Changing your password, turning two-factor sign-in on or off, or being reset by an administrator ends your other sessions.
+
+**Passwords.** 12-128 characters, not on a built-in list of common passwords, not one repeated character and not built from the account's email address. This is not a breached-password database. Repeated failures throttle the account (see *Request limits*).
+
+**Forgot your password.** There is no mail server in this stack, so an administrator issues a one-time reset link (Users → *Reset link*) and hands it to the person. The link is valid for one hour, works once, a newer link cancels an older one, and only a hash of it is stored. Using it sets the password and signs the account out everywhere; it does not bypass a second factor.
+
+**Two-factor sign-in.** Anyone can turn on authenticator-app codes (TOTP: Google Authenticator, Authy, 1Password and the like) under *Account*. They get ten single-use recovery codes, shown once. A code works once, a wrong guess costs five tries per five minutes, and the secret is encrypted with `ENCRYPTION_KEY` (and moves with it in a rotation). Set `REQUIRE_MFA_ROLES` (for example `registrar,exam_cell,university_admin`) to make roles use it: until they have set it up, their session can do nothing else, and they cannot turn it off. A lost device is reset by an administrator (Users → *Reset 2FA*); if no administrator can sign in, run `docker compose exec backend ./server totp-reset someone@example.edu`.
+
 ## Client addresses behind a proxy
 
 Rate limits and the audit log use the client's address. The backend believes `X-Forwarded-For` only when the connection comes from an address in `TRUSTED_PROXIES` (comma-separated addresses or ranges such as `172.29.250.12` or `10.0.0.0/8`). Then it reads the header from the right, skipping trusted proxies, and takes the first address that is not one: whatever the client wrote further left is ignored, so a client cannot pick its own address even if a proxy appends instead of replacing. Anyone else connecting, or a malformed header, gets the connecting address. With `TRUSTED_PROXIES` unset the header is ignored entirely. The old `TRUST_PROXY=true` is refused at startup because it trusted whoever connected. The development compose file trusts loopback and the private ranges Docker uses; the production one trusts only the web container's fixed address.
@@ -222,7 +232,7 @@ scenario (it is part of CI). This protects the keys only: you still need regular
 | Control | Implementation |
 |---|---|
 | RBAC | Role read from the database on every request (demotion/deactivation is immediate); per-endpoint checks |
-| Auth | Argon2id passwords, HS256 JWT bound to a server-side session (logout revokes), 8h expiry, timing-equalised login |
+| Auth | Argon2id passwords with a common-password check, HS256 JWT bound to a server-side session (logout revokes; sessions are listable and revocable), 8h expiry, timing-equalised login, optional or required TOTP second factor |
 | Replay protection | Every POST needs `X-Nonce` (single use) and `X-Timestamp` (within 60s) |
 | Rate limiting | Counted in Postgres, so it holds across instances and restarts: 10 logins/min and 240 anonymous requests/min per client address, 600 requests/min per signed-in user, and failed logins throttled per account (20 per 15 min) whatever the address; configurable |
 | Input / WAF | Field validation, 16 KB body limit, security headers + strict CSP, parameterised SQL only; production stack adds the OWASP Core Rule Set WAF |
@@ -233,11 +243,13 @@ scenario (it is part of CI). This protects the keys only: you still need regular
 
 ## API
 
-Public: `POST /auth/login`, `GET /verify/:id`, `GET /credentials/:id/qr`, `GET /ledger/verify`.
+Public: `POST /auth/login`, `POST /auth/login/mfa`, `POST /auth/reset-password`, `GET /verify/:id`, `GET /credentials/:id/qr`, `GET /ledger/verify`.
 Authenticated: `GET /auth/me`, `POST /auth/logout`, `GET|POST /credentials`, `GET /credentials/:id`,
 `POST /credentials/:id/{approve,reject,revoke,reissue}`, `GET /keys`, `POST /keys/:role/rotate`, `POST /keys/:id/revoke`,
-`GET /ledger/blocks`, `POST /ledger/seal`, `GET /audit`, `POST /auth/password`.
-`university_admin` only: `GET|POST /users`, `POST /users/:id/{role,active,password}`. All under `/api/v1`.
+`GET /ledger/blocks`, `POST /ledger/seal`, `GET /audit`, `POST /auth/password`, `GET /auth/sessions`,
+`POST /auth/sessions/:id/revoke`, `POST /auth/sessions/revoke-others`, `GET /auth/totp`,
+`POST /auth/totp/{setup,enable,disable,recovery-codes}`.
+`university_admin` only: `GET|POST /users`, `POST /users/:id/{role,active,password,reset-link,totp/reset,sessions/revoke}`. All under `/api/v1`.
 
 ## Limits you should know about
 
@@ -246,7 +258,7 @@ Authenticated: `GET /auth/me`, `POST /auth/logout`, `GET|POST /credentials`, `GE
 - The built-in WAF is the generic OWASP rule set on a single host. It does not absorb DDoS traffic or replace a managed WAF/CDN; for large-scale exposure put one in front of the edge.
 - The encryption key lives in an environment variable and can be rotated (above), but it is still a plain secret on the host. For higher assurance wrap the signing keys with a KMS/HSM (for example HashiCorp Vault's Transit engine); that is not built in. Losing it is recoverable only if you made a key backup (see above).
 - Stage keys belong to a stage, not a person; for personal accountability use personal signatures (above), which are optional unless `REQUIRE_PERSONAL_SIGNATURES=true`.
-- No account lockout, MFA or self-service password *reset* (forgot password); an admin can reset a password for a user.
+- Password reset is administrator-assisted (no e-mail), and two-factor sign-in is opt-in unless `REQUIRE_MFA_ROLES` is set. Authenticator codes can be phished like passwords; the optional personal security keys (above) are the phishing-resistant option for approvals.
 
 ## Contributing
 

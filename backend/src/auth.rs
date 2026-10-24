@@ -22,7 +22,7 @@ use crate::{
     audit,
     config::Cidr,
     error::{AppError, Res},
-    security, AppState,
+    security, totp, AppState,
 };
 
 pub const TOKEN_HOURS: i64 = 8;
@@ -64,6 +64,8 @@ pub struct AuthUser {
     pub email: String,
     pub role: Role,
     pub session: Uuid,
+    /// Signed in with a password but still has to set up the second factor its role requires.
+    pub mfa_pending: bool,
 }
 
 impl AuthUser {
@@ -147,21 +149,28 @@ impl FromRequestParts<AppState> for AuthUser {
         let session: Uuid = claims.jti.parse().map_err(|_| unauth())?;
         let user: Uuid = claims.sub.parse().map_err(|_| unauth())?;
         // Role comes from the database, not the token, so demotions/deactivation apply immediately.
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT u.email, u.role FROM sessions s JOIN users u ON u.id = s.user_id
+        let row: Option<(String, String, bool)> = sqlx::query_as(
+            "SELECT u.email, u.role, s.mfa_pending FROM sessions s JOIN users u ON u.id = s.user_id
              WHERE s.id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL AND s.expires_at > now() AND u.active",
         )
         .bind(session)
         .bind(user)
         .fetch_optional(&state.db)
         .await?;
-        let (email, role) = row.ok_or_else(unauth)?;
+        let (email, role, mfa_pending) = row.ok_or_else(unauth)?;
+        // Until the second factor exists, the only things such a session may do are about signing in and setting it up.
+        if mfa_pending && !parts.uri.path().starts_with("/api/v1/auth/") {
+            return Err(AppError::Forbidden(
+                "two-factor sign-in must be set up first".into(),
+            ));
+        }
         let role = Role::parse(&role).ok_or_else(unauth)?;
         Ok(AuthUser {
             id: user,
             email,
             role,
             session,
+            mfa_pending,
         })
     }
 }
@@ -273,22 +282,59 @@ pub async fn login(
         return Err(AppError::Unauthorized("invalid email or password".into()));
     };
 
+    // People with a second factor get a token that is good for nothing but the second step.
+    let (has_totp,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM user_totp WHERE user_id = $1 AND confirmed_at IS NOT NULL)",
+    )
+    .bind(user.id)
+    .fetch_one(&st.db)
+    .await?;
+    if has_totp {
+        return Ok(Json(totp::begin(&st, user.id)?));
+    }
+    // A role that must have one, without one yet, may sign in only to set it up.
+    let pending = Role::parse(&user.role).is_some_and(|r| st.cfg.require_mfa_roles.contains(&r));
+    finish_login(&st, user.id, &email, &user.role, &ip, &headers, pending).await
+}
+
+/// Opens the session and returns the token. Shared by the password step and the second factor step.
+pub async fn finish_login(
+    st: &AppState,
+    user_id: Uuid,
+    email: &str,
+    role: &str,
+    ip: &str,
+    headers: &HeaderMap,
+    mfa_pending: bool,
+) -> Res<Json<Value>> {
     let now = Utc::now();
     let exp = now + Duration::hours(TOKEN_HOURS);
     let session = Uuid::new_v4();
-    sqlx::query("INSERT INTO sessions (id, user_id, expires_at) VALUES ($1, $2, $3)")
+    let agent: String = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect();
+    sqlx::query(
+        "INSERT INTO sessions (id, user_id, expires_at, ip, user_agent, mfa_pending) VALUES ($1, $2, $3, $4, $5, $6)",
+    )
         .bind(session)
-        .bind(user.id)
+        .bind(user_id)
         .bind(exp)
+        .bind(ip)
+        .bind(agent)
+        .bind(mfa_pending)
         .execute(&st.db)
         .await?;
 
     let token = encode(
         &Header::default(),
         &Claims {
-            sub: user.id.to_string(),
-            email: email.clone(),
-            role: user.role.clone(),
+            sub: user_id.to_string(),
+            email: email.to_string(),
+            role: role.to_string(),
             jti: session.to_string(),
             iat: now.timestamp(),
             exp: exp.timestamp(),
@@ -299,21 +345,23 @@ pub async fn login(
 
     audit::log(
         &st.db,
-        Some(user.id),
-        Some(&email),
+        Some(user_id),
+        Some(email),
         "LOGIN",
         Some("user"),
-        Some(&user.id.to_string()),
+        Some(&user_id.to_string()),
         json!({ "ip": ip }),
     )
     .await;
     Ok(Json(
-        json!({ "token": token, "expires_in": TOKEN_HOURS * 3600, "email": email, "role": user.role }),
+        json!({ "token": token, "expires_in": TOKEN_HOURS * 3600, "email": email, "role": role, "mfa_setup_required": mfa_pending }),
     ))
 }
 
 pub async fn me(user: AuthUser) -> Json<Value> {
-    Json(json!({ "id": user.id, "email": user.email, "role": user.role.as_str() }))
+    Json(
+        json!({ "id": user.id, "email": user.email, "role": user.role.as_str(), "mfa_setup_required": user.mfa_pending }),
+    )
 }
 
 pub async fn logout(State(st): State<AppState>, user: AuthUser) -> Res<Json<Value>> {

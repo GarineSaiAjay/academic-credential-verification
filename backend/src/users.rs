@@ -39,14 +39,92 @@ pub fn normalize_email(raw: &str) -> Res<String> {
     }
 }
 
-pub fn check_password(password: &str) -> Res<()> {
-    if (MIN_PASSWORD..=MAX_PASSWORD).contains(&password.chars().count()) {
-        Ok(())
-    } else {
-        Err(AppError::BadRequest(format!(
+/// Passwords people actually choose at twelve characters or more. Not a breach database: a short list that
+/// stops the worst, checked case-insensitively.
+const COMMON: &[&str] = &[
+    "password1234",
+    "password12345",
+    "password123456",
+    "passw0rd1234",
+    "p@ssw0rd1234",
+    "123456789012",
+    "1234567890123",
+    "12345678901234",
+    "111111111111",
+    "000000000000",
+    "123123123123",
+    "abcdefghijkl",
+    "qwertyuiop12",
+    "qwertyuiop123",
+    "qwertyuiopas",
+    "qwertyuiop[]",
+    "asdfghjkl123",
+    "1q2w3e4r5t6y",
+    "1qaz2wsx3edc",
+    "zaq12wsxcde3",
+    "iloveyou1234",
+    "iloveyou12345",
+    "welcome12345",
+    "welcome12345!",
+    "changeme1234",
+    "changeme12345",
+    "letmein12345",
+    "letmein123456",
+    "administrator",
+    "administrator1",
+    "administrator123",
+    "universityuniversity",
+    "university123",
+    "university1234",
+    "university12345",
+    "university2024",
+    "university2025",
+    "university2026",
+    "trustno1trustno1",
+    "monkey123456",
+    "dragon123456",
+    "football1234",
+    "baseball1234",
+    "superman1234",
+    "sunshine1234",
+    "princess1234",
+    "mypassword123",
+    "mypassword1234",
+    "thisisapassword",
+    "correcthorsebatterystaple",
+    "passwordpassword",
+    "adminadminadmin",
+    "admin1234567",
+    "admin12345678",
+    "root12345678",
+    "test12345678",
+    "testtesttest",
+    "default12345",
+];
+
+/// Length, the common-password list, and (when the account is known) not built from the e-mail address or
+/// from one repeated character.
+pub fn check_password_for(password: &str, email: Option<&str>) -> Res<()> {
+    let n = password.chars().count();
+    if !(MIN_PASSWORD..=MAX_PASSWORD).contains(&n) {
+        return Err(AppError::BadRequest(format!(
             "password must be {MIN_PASSWORD}-{MAX_PASSWORD} characters"
-        )))
+        )));
     }
+    let lower = password.to_lowercase();
+    let first = password.chars().next();
+    let weak = COMMON.contains(&lower.as_str())
+        || password.chars().all(|c| Some(c) == first)
+        || email.is_some_and(|e| {
+            let local = e.split('@').next().unwrap_or(e);
+            lower == e || (local.chars().count() >= 6 && lower.contains(local))
+        });
+    if weak {
+        return Err(AppError::BadRequest(
+            "that password is too easy to guess: avoid common passwords, repeated characters and your e-mail address".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_role(s: &str) -> Res<Role> {
@@ -78,7 +156,7 @@ pub async fn bootstrap_admin(st: &AppState) -> Res<()> {
         return Ok(());
     }
     let email = normalize_email(email)?;
-    check_password(password)?;
+    check_password_for(password, Some(&email))?;
     let id = match insert_user(&st.db, &email, Role::UniversityAdmin, password).await {
         Ok(id) => id,
         // Another instance won the race to create it.
@@ -106,12 +184,15 @@ struct UserInfo {
     role: String,
     active: bool,
     created_at: DateTime<Utc>,
+    two_factor: bool,
 }
 
 pub async fn list(State(st): State<AppState>, user: AuthUser) -> Res<Json<Value>> {
     user.require(&[Role::UniversityAdmin])?;
     let rows: Vec<UserInfo> = sqlx::query_as(
-        "SELECT id, email, role, active, created_at FROM users ORDER BY email LIMIT 1000",
+        "SELECT id, email, role, active, created_at,
+                EXISTS (SELECT 1 FROM user_totp t WHERE t.user_id = users.id AND t.confirmed_at IS NOT NULL) AS two_factor
+         FROM users ORDER BY email LIMIT 1000",
     )
     .fetch_all(&st.db)
     .await?;
@@ -133,7 +214,7 @@ pub async fn create(
     user.require(&[Role::UniversityAdmin])?;
     let email = normalize_email(&b.email)?;
     let role = parse_role(&b.role)?;
-    check_password(&b.password)?;
+    check_password_for(&b.password, Some(&email))?;
     let id = insert_user(&st.db, &email, role, &b.password)
         .await
         .map_err(|e| match e {
@@ -304,7 +385,12 @@ pub async fn reset_password(
             "use change password for your own account".into(),
         ));
     }
-    check_password(&b.password)?;
+    let (target,): (String,) = sqlx::query_as("SELECT email FROM users WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&st.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("no such user".into()))?;
+    check_password_for(&b.password, Some(&target))?;
     let hash = auth::hash_password(&b.password)?;
 
     let mut tx = st.db.begin().await?;
@@ -348,7 +434,7 @@ pub async fn change_password(
     if !hit.allowed {
         return Err(AppError::TooMany(hit.retry_after));
     }
-    check_password(&b.new_password)?;
+    check_password_for(&b.new_password, Some(&user.email))?;
     if b.new_password == b.current_password {
         return Err(AppError::BadRequest(
             "new password must differ from the current one".into(),
@@ -419,10 +505,30 @@ mod tests {
     }
 
     #[test]
+    fn weak_passwords_are_refused() {
+        for weak in [
+            "Password1234",
+            "aaaaaaaaaaaa",
+            "QWERTYUIOP12",
+            "ada.lovelace@example.edu",
+            "my-ada.lovelace-1",
+        ] {
+            assert!(
+                check_password_for(weak, Some("ada.lovelace@example.edu")).is_err(),
+                "{weak:?} should be refused"
+            );
+        }
+        assert!(check_password_for("a long, unusual passphrase", Some("ada@x.edu")).is_ok());
+        // a short local part is not a reason to refuse everything that contains it
+        assert!(check_password_for("quite-different-1x", Some("ada@x.edu")).is_ok());
+    }
+
+    #[test]
     fn password_length_is_bounded() {
-        assert!(check_password(&"a".repeat(MIN_PASSWORD - 1)).is_err());
-        assert!(check_password(&"a".repeat(MIN_PASSWORD)).is_ok());
-        assert!(check_password(&"a".repeat(MAX_PASSWORD)).is_ok());
-        assert!(check_password(&"a".repeat(MAX_PASSWORD + 1)).is_err());
+        let pw = |n: usize| "xk7Q-".repeat(n).chars().take(n).collect::<String>();
+        assert!(check_password_for(&pw(MIN_PASSWORD - 1), None).is_err());
+        assert!(check_password_for(&pw(MIN_PASSWORD), None).is_ok());
+        assert!(check_password_for(&pw(MAX_PASSWORD), None).is_ok());
+        assert!(check_password_for(&pw(MAX_PASSWORD + 1), None).is_err());
     }
 }
