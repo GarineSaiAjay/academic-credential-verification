@@ -225,7 +225,46 @@ docker compose up -d
 
 Restore keeps the same signing keys, so existing credentials keep verifying. It also rebuilds the keys on an empty database,
 and it refuses to overwrite a key whose public half differs from the backup. `scripts/recovery-test.sh` runs this whole
-scenario (it is part of CI). This protects the keys only: you still need regular database backups (`pg_dump`) for everything else.
+scenario (it is part of CI). This protects the keys only: everything else needs the database backups described next.
+
+## Backing up and restoring the database
+
+Everything that is not a key or a configuration value lives in Postgres: credentials, approvals, the ledger and its timestamp
+tokens, users, sessions, two-factor enrolments and the audit log. Losing the volume loses all of it, so back it up.
+
+```bash
+export BACKUP_PASSPHRASE='a long passphrase you will not lose'   # at least 12 characters; strongly recommended
+KEEP=14 scripts/backup.sh          # writes backups/acvs-<UTC time>.dump.enc and a .sha256 file, keeps the newest 14
+```
+
+The backup is a consistent snapshot taken while the system runs. It is encrypted when `BACKUP_PASSPHRASE` is set (it holds
+password hashes and the sealed signing keys), readable only by you, read back and counted before it is kept, and
+checksummed. It does **not** contain `ENCRYPTION_KEY`: keep that (and your `key-backup`) elsewhere. A backup without the key
+restores credentials and history, but the signing keys in it cannot be opened. Copy the files off the host; a backup on the
+same disk is not a backup. For the production stack set `COMPOSE_FILE=docker-compose.prod.yml`. To run it nightly:
+`17 2 * * * cd /srv/acvs && BACKUP_PASSPHRASE=... KEEP=30 scripts/backup.sh`.
+
+To restore after losing the database (or to move to a new host):
+
+```bash
+# new host: copy .env with the SAME ENCRYPTION_KEY, then start only the database
+docker compose up -d postgres
+BACKUP_PASSPHRASE=... scripts/restore.sh backups/acvs-20261101T021700Z.dump.enc   # add --yes if the database holds data
+docker compose up -d
+```
+
+`restore.sh` checks the checksum, decrypts and reads the whole backup *before* it touches anything, so a damaged file or a
+wrong passphrase costs you nothing. It then replaces the database, starts the backend (which applies newer migrations and
+refuses to run if `ENCRYPTION_KEY` is wrong) and verifies the restored ledger. Changes made after the backup are gone, so
+the audit log and the ledger return to that moment. Test a restore on a spare machine now and then.
+`scripts/backup-test.sh` does exactly this in CI: it destroys the volume, restores, and checks credentials, a revocation, a
+user's two-factor, the signing keys and the ledger.
+
+**Withdrawing a release.** Migrations only go forward when the server starts. If a release has to be undone, run
+`scripts/migrate-down.sh TARGET --yes` (for example `6` undoes migrations 0008 and 0007). Each undo script in
+`backend/migrations-down/` says what data it deletes; a backup is taken first, the backend is stopped, and you then start the
+older release. Migration 0001 cannot be undone (that would be the whole database): restore a backup instead. The test applies
+and reverses every migration and checks the schema is identical afterwards.
 
 ## Security controls
 
