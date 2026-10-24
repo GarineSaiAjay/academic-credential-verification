@@ -404,15 +404,6 @@ pub async fn summary(db: &PgPool, height: i64, block_hash: &str) -> Res<Option<V
     ))
 }
 
-/// "none", "ok", or "mismatch" (the stored imprint is not this block's hash).
-pub async fn chain_status(db: &PgPool, height: i64, block_hash: &str) -> Res<&'static str> {
-    Ok(match load(db, height).await? {
-        None => "none",
-        Some(s) if s.imprint == block_hash => "ok",
-        Some(_) => "mismatch",
-    })
-}
-
 /// Public: the stored token for a block, re-verified now.
 pub async fn show(State(st): State<AppState>, UrlPath(height): UrlPath<i64>) -> Res<Json<Value>> {
     let Some(s) = load(&st.db, height).await? else {

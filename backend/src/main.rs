@@ -10,6 +10,7 @@ mod keybackup;
 mod keys;
 mod ledger;
 mod metrics;
+mod page;
 mod reset;
 mod security;
 mod sessions;
@@ -42,7 +43,12 @@ pub struct AppState {
     pub limiter: Arc<RateLimiter>,
     /// Held while a timestamping pass runs, so passes in this process never overlap.
     pub ts_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The latest whole-chain verification, shared by everyone who asks within its lifetime.
+    pub chain_cache: ChainCache,
 }
+
+pub type ChainCache =
+    Arc<tokio::sync::Mutex<Option<(std::time::Instant, Arc<ledger::ChainSummary>)>>>;
 
 /// Advisory-lock id that serialises first-start initialisation across instances.
 const INIT_LOCK: i64 = 0x4143_5653_0001;
@@ -288,6 +294,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg: Arc::new(cfg),
         limiter: Arc::new(RateLimiter::default()),
         ts_lock: Arc::new(tokio::sync::Mutex::new(())),
+        chain_cache: Arc::default(),
     };
     tokio::spawn(security::cleanup_forever(st.db.clone()));
     tokio::spawn(sessions::purge_forever(st.db.clone()));

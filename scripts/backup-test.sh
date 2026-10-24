@@ -101,12 +101,12 @@ expect "and their checksums" "$(ls "$BACKUP_DIR"/*.sha256 | wc -l | tr -d ' ')" 
 
 echo "== rolling the schema back"
 LATEST=$(DBX "SELECT max(version) FROM _sqlx_migrations")
-expect "all eight migrations are applied" "$LATEST" 8
+expect "all nine migrations are applied" "$LATEST" 9
 SCHEMA_FULL=$(schema)
 OUT=$(scripts/migrate-down.sh 6 2>&1); [ $? -ne 0 ] && ok "rolling back needs --yes" || bad "no --yes needed: $OUT"
 OUT=$(SKIP_BACKUP=1 scripts/migrate-down.sh 0 --yes 2>&1); [ $? -ne 0 ] && ok "0001 cannot be undone" || bad "target 0 accepted"
 N_BEFORE=$(ls "$BACKUP_DIR"/acvs-*.dump* | grep -vc '\.sha256$')
-OUT=$(scripts/migrate-down.sh 6 --yes 2>&1); echo "$OUT" | grep -q 'undid migration(s): 8 7' && ok "migrations 8 and 7 are undone" || bad "migrate-down: $OUT"
+OUT=$(scripts/migrate-down.sh 6 --yes 2>&1); echo "$OUT" | grep -q 'undid migration(s): 9 8 7' && ok "migrations 9, 8 and 7 are undone" || bad "migrate-down: $OUT"
 expect "it took a backup first" "$(ls "$BACKUP_DIR"/acvs-*.dump* | grep -vc '\.sha256$')" "$((N_BEFORE + 1))"
 expect "the schema is at version 6" "$(DBX "SELECT max(version) FROM _sqlx_migrations")" 6
 expect "the two-factor tables are gone" "$(DBX "SELECT count(*) FROM pg_tables WHERE tablename IN ('user_totp','totp_recovery','password_resets')")" 0
@@ -116,7 +116,7 @@ expect "data from earlier migrations is intact" "$(DBX "SELECT count(*) FROM cre
 SKIP_BACKUP=1 scripts/migrate-down.sh 1 --yes >/dev/null 2>&1; expect "every migration after the first can be undone" "$(DBX "SELECT max(version) FROM _sqlx_migrations")" 1
 expect "what remains is the first schema" "$(DBX "SELECT count(*) FROM pg_tables WHERE schemaname='public' AND tablename IN ('block_timestamps','credential_events','user_keys','rate_limits')")" 0
 docker compose up -d --wait backend >/dev/null 2>&1 && ok "the current backend applies the migrations again on start" || bad "backend did not start after roll-forward"
-expect "back at version 8" "$(DBX "SELECT max(version) FROM _sqlx_migrations")" 8
+expect "back at version 9" "$(DBX "SELECT max(version) FROM _sqlx_migrations")" 9
 [ "$(schema)" = "$SCHEMA_FULL" ] && ok "and the schema is identical to before the round trip" || { bad "schema differs after the round trip"; diff <(echo "$SCHEMA_FULL") <(schema) | head; }
 
 echo

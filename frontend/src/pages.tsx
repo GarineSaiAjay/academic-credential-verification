@@ -18,6 +18,32 @@ function useLoad<T>(path: string | null) {
   return { data, error, reload: useCallback(() => setTick((t) => t + 1), []) };
 }
 
+/** A list that arrives a page at a time: the first page loads by itself, `more` appends the next one. */
+function usePaged<T = any>(path: string, key: string) {
+  const first = useLoad<any>(path);
+  const [extra, setExtra] = useState<T[]>([]);
+  const [next, setNext] = useState<string | number | null | undefined>(undefined);
+  const [moreError, setMoreError] = useState('');
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { setExtra([]); setNext(undefined); setMoreError(''); }, [first.data]);
+  const cursor = next === undefined ? (first.data?.next ?? null) : next;
+  const more = async () => {
+    if (cursor == null) return;
+    setBusy(true); setMoreError('');
+    try {
+      const r = await api<any>('GET', `${path}${path.includes('?') ? '&' : '?'}before=${encodeURIComponent(String(cursor))}`);
+      setExtra((e) => [...e, ...r[key]]);
+      setNext(r.next ?? null);
+    } catch (e) { setMoreError((e as Error).message); }
+    setBusy(false);
+  };
+  const items: T[] = [...(first.data?.[key] ?? []), ...extra];
+  return { data: first.data, items, error: first.error || moreError, reload: first.reload, hasMore: cursor != null, more, busy };
+}
+
+const LoadMore = ({ hasMore, busy, onClick }: { hasMore: boolean; busy: boolean; onClick: () => void }) =>
+  hasMore ? <p><button disabled={busy} onClick={onClick}>{busy ? 'Loading...' : 'Load more'}</button></p> : null;
+
 function useAction() {
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const run = async (fn: () => Promise<unknown>, okText: string, after?: () => void) => {
@@ -126,7 +152,10 @@ const STATUSES = ['', 'pending_exam_cell', 'pending_registrar', 'pending_univers
 
 export function CredList({ role }: { role: Role }) {
   const [status, setStatus] = useState(QUEUE[role] ?? '');
-  const { data, error } = useLoad<{ credentials: Row[] }>(`/credentials${status ? `?status=${status}` : ''}`);
+  const [student, setStudent] = useState('');
+  const [studentFilter, setStudentFilter] = useState('');
+  const query = [status && `status=${status}`, studentFilter && `student_id=${encodeURIComponent(studentFilter)}`, 'limit=50'].filter(Boolean).join('&');
+  const { items, error, hasMore, more, busy, data } = usePaged<Row>(`/credentials?${query}`, 'credentials');
   return (
     <Card title={role === 'faculty' ? 'My credentials' : 'Credentials'}>
       <Err msg={error} />
@@ -136,12 +165,16 @@ export function CredList({ role }: { role: Role }) {
             {STATUSES.map((s) => <option key={s} value={s}>{s ? s.replace(/_/g, ' ') : 'all'}</option>)}
           </select>
         </label>
+        <form onSubmit={(e) => { e.preventDefault(); setStudentFilter(student.trim()); }}>
+          <label>Student ID{' '}<input value={student} onChange={(e) => setStudent(e.target.value)} placeholder="exact match" /></label>{' '}
+          <button className="small">Filter</button>
+        </form>
         {role === 'faculty' && <a className="btn" href="#/new">New credential</a>}
       </div>
       <table>
         <thead><tr><th>ID</th><th>Student</th><th>Program</th><th>Status</th><th>Created</th></tr></thead>
         <tbody>
-          {data?.credentials.map((c) => (
+          {items.map((c) => (
             <tr key={c.id}>
               <td><a href={`#/c/${c.id}`}>{short(c.id)}</a></td>
               <td>{c.student_name} <span className="muted">({c.student_id})</span></td>
@@ -150,9 +183,10 @@ export function CredList({ role }: { role: Role }) {
               <td>{when(c.created_at)}</td>
             </tr>
           ))}
-          {data && data.credentials.length === 0 && <tr><td colSpan={5} className="muted">Nothing here.</td></tr>}
+          {data && items.length === 0 && <tr><td colSpan={5} className="muted">Nothing here.</td></tr>}
         </tbody>
       </table>
+      <LoadMore hasMore={hasMore} busy={busy} onClick={more} />
     </Card>
   );
 }
@@ -356,7 +390,7 @@ export function Keys({ role }: { role: Role }) {
 }
 
 export function Ledger({ role }: { role: Role }) {
-  const { data, error, reload } = useLoad<any>('/ledger/blocks');
+  const { data, items: blocks, error, reload, hasMore, more, busy } = usePaged<any>('/ledger/blocks?limit=50', 'blocks');
   const [chain, setChain] = useState<any>(null);
   const { run, banner } = useAction();
   return (
@@ -366,29 +400,30 @@ export function Ledger({ role }: { role: Role }) {
         {role === 'university_admin' && <button onClick={() => run(() => api('POST', '/ledger/seal'), 'Block sealed', reload)}>Seal {data ? data.pending_unanchored : ''} issued credential(s) into a block</button>}
         {role === 'university_admin' && data?.timestamping && <button onClick={() => run(async () => { const r = await api<{ stamped: number; failed: { height: number; error: string }[] }>('POST', '/ledger/timestamp'); if (r.failed.length) throw new Error(`Block ${r.failed[0].height}: ${r.failed[0].error}`); return r; }, 'Pending blocks timestamped', reload)}>Timestamp pending blocks now</button>}
         <button onClick={() => api('GET', '/ledger/verify').then(setChain)}>Verify whole chain</button>
-        {chain && <span className={chain.ok ? 'good' : 'bad'}>{chain.ok ? `chain intact (${chain.length} blocks)` : 'CHAIN BROKEN'}</span>}
+        {chain && <span className={chain.ok ? 'good' : 'bad'}>{chain.ok ? `chain intact (${chain.length} blocks)` : `CHAIN BROKEN (blocks ${chain.failed_blocks?.join(', ')})`}</span>}
       </div>
       <table>
         <thead><tr><th>#</th><th>Credentials</th><th>Merkle root</th><th>Block hash</th><th>Sealed</th>{data?.timestamping && <th>External timestamp</th>}</tr></thead>
         <tbody>
-          {data?.blocks.map((b: any) => (
+          {blocks.map((b: any) => (
             <tr key={b.height}><td>{b.height}</td><td>{b.credentials}</td><td className="mono">{short(b.merkle_root, 16)}…</td><td className="mono">{short(b.block_hash, 16)}…</td><td>{when(b.timestamp)}</td>{data.timestamping && <td>{b.external_timestamp ? <a href={`#/ledger`} onClick={(e) => { e.preventDefault(); api('GET', `/ledger/blocks/${b.height}/timestamp`).then((t) => window.alert(`${t.verified ? 'Verified' : 'NOT VERIFIED'}\nsigned ${when(t.time)} by ${t.tsa}\nserial ${t.serial}${t.error ? `\n${t.error}` : ''}`)); }}>{when(b.external_timestamp.time)}</a> : <span className="muted">pending</span>}</td>}</tr>
           ))}
         </tbody>
       </table>
+      <LoadMore hasMore={hasMore} busy={busy} onClick={more} />
     </Card>
   );
 }
 
 export function Audit() {
-  const { data, error } = useLoad<{ logs: any[] }>('/audit?limit=200');
+  const { items: logs, error, hasMore, more, busy } = usePaged<any>('/audit?limit=100', 'logs');
   return (
     <Card title="Audit log">
       <Err msg={error} />
       <table>
         <thead><tr><th>#</th><th>Time</th><th>Actor</th><th>Action</th><th>Resource</th><th>Details</th></tr></thead>
         <tbody>
-          {data?.logs.map((l) => (
+          {logs.map((l) => (
             <tr key={l.id}>
               <td>{l.id}</td><td>{when(l.at)}</td><td>{l.actor ?? '-'}</td><td>{l.action}</td>
               <td className="mono">{l.resource_type ? `${l.resource_type}:${short(l.resource_id ?? '', 8)}` : '-'}</td>
@@ -397,6 +432,7 @@ export function Audit() {
           ))}
         </tbody>
       </table>
+      <LoadMore hasMore={hasMore} busy={busy} onClick={more} />
     </Card>
   );
 }

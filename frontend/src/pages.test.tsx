@@ -2,7 +2,7 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getSession } from './api';
-import { Login, ResetPassword, Verify } from './pages';
+import { Audit, CredList, Ledger, Login, ResetPassword, Verify } from './pages';
 
 type Reply = { status?: number; body: unknown };
 /** Answers fetch calls in order; returns the mock so tests can inspect what was sent. */
@@ -176,5 +176,83 @@ describe('Verify', () => {
     serve({ status: 404, body: { error: 'not found' } });
     render(<Verify id="nope" />);
     expect(await screen.findByText('not found')).toBeInTheDocument();
+  });
+});
+
+const row = (n: number) => ({ id: `0000000${n}-aaaa-bbbb-cccc-dddddddddddd`, student_id: `S${n}`, student_name: `Student ${n}`, program: 'BSc', status: 'issued', created_at: '2026-01-01T00:00:00Z' });
+
+describe('lists that arrive a page at a time', () => {
+  it('shows the first page, then appends the next one when asked, and stops when there is no more', async () => {
+    const f = serve(
+      { body: { credentials: [row(3), row(2)], next: 'CURSOR-1' } },
+      { body: { credentials: [row(1)], next: null } },
+    );
+    render(<CredList role="auditor" />);
+    expect(await screen.findByText('Student 3')).toBeInTheDocument();
+    expect(f.mock.calls[0][0]).toBe('/api/v1/credentials?limit=50');
+    expect(screen.queryByText('Student 1')).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Load more' }));
+    expect(await screen.findByText('Student 1')).toBeInTheDocument();
+    expect(screen.getByText('Student 3')).toBeInTheDocument();
+    expect(f.mock.calls[1][0]).toBe('/api/v1/credentials?limit=50&before=CURSOR-1');
+    expect(screen.queryByRole('button', { name: 'Load more' })).not.toBeInTheDocument();
+  });
+
+  it('offers no button when everything fit on one page', async () => {
+    serve({ body: { credentials: [row(1)], next: null } });
+    render(<CredList role="auditor" />);
+    await screen.findByText('Student 1');
+    expect(screen.queryByRole('button', { name: 'Load more' })).not.toBeInTheDocument();
+  });
+
+  it('filters by student id and starts again from the first page', async () => {
+    const f = serve(
+      { body: { credentials: [row(1), row(2)], next: null } },
+      { body: { credentials: [row(2)], next: null } },
+    );
+    render(<CredList role="auditor" />);
+    await screen.findByText('Student 1');
+    await userEvent.type(screen.getByLabelText('Student ID'), 'S2');
+    await userEvent.click(screen.getByRole('button', { name: 'Filter' }));
+    await waitFor(() => expect(screen.queryByText('Student 1')).not.toBeInTheDocument());
+    expect(f.mock.calls[1][0]).toBe('/api/v1/credentials?student_id=S2&limit=50');
+  });
+
+  it('shows an error from a later page without losing the pages already shown', async () => {
+    serve({ body: { credentials: [row(2)], next: 'C' } }, { status: 500, body: { error: 'database unavailable' } });
+    render(<CredList role="auditor" />);
+    await screen.findByText('Student 2');
+    await userEvent.click(screen.getByRole('button', { name: 'Load more' }));
+    expect(await screen.findByText('database unavailable')).toBeInTheDocument();
+    expect(screen.getByText('Student 2')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Load more' })).toBeEnabled();
+  });
+
+  it('pages the audit log by entry number', async () => {
+    const f = serve(
+      { body: { logs: [{ id: 9, at: '2026-01-01T00:00:00Z', action: 'LOGIN', actor: 'a@u.edu' }], next: 9 } },
+      { body: { logs: [{ id: 8, at: '2026-01-01T00:00:00Z', action: 'LOGOUT', actor: 'a@u.edu' }], next: null } },
+    );
+    render(<Audit />);
+    await screen.findByText('LOGIN');
+    await userEvent.click(screen.getByRole('button', { name: 'Load more' }));
+    expect(await screen.findByText('LOGOUT')).toBeInTheDocument();
+    expect(f.mock.calls[1][0]).toBe('/api/v1/audit?limit=100&before=9');
+  });
+
+  it('pages the ledger and names the broken blocks when the chain check fails', async () => {
+    const block = (h: number) => ({ height: h, credentials: 1, merkle_root: 'a'.repeat(64), block_hash: 'b'.repeat(64), timestamp: 1700000000 + h, external_timestamp: null });
+    const f = serve(
+      { body: { blocks: [block(3)], next: 3, pending_unanchored: 0, timestamping: null } },
+      { body: { blocks: [block(2)], next: null } },
+      { body: { ok: false, length: 3, failed_blocks: [2], blocks: [] } },
+    );
+    render(<Ledger role="auditor" />);
+    await screen.findByText('3');
+    await userEvent.click(screen.getByRole('button', { name: 'Load more' }));
+    await waitFor(() => expect(f.mock.calls[1][0]).toBe('/api/v1/ledger/blocks?limit=50&before=3'));
+    await userEvent.click(screen.getByRole('button', { name: 'Verify whole chain' }));
+    expect(await screen.findByText('CHAIN BROKEN (blocks 2)')).toBeInTheDocument();
   });
 });

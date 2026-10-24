@@ -19,7 +19,7 @@ use crate::{
     auth::{AuthUser, Role},
     crypto,
     error::{AppError, Res},
-    keys, webauthn, AppState,
+    keys, page, webauthn, AppState,
 };
 
 pub const STAGES: [&str; 4] = ["faculty", "exam_cell", "registrar", "university"];
@@ -460,25 +460,56 @@ pub async fn create(
 #[derive(Deserialize)]
 pub struct ListQuery {
     status: Option<String>,
+    student_id: Option<String>,
+    limit: Option<i64>,
+    /// The `next` value of the previous page.
+    before: Option<String>,
 }
 
+/// One page of credentials, newest first. `next` is the cursor for the following page, or null at the end.
 pub async fn list(
     State(st): State<AppState>,
     user: AuthUser,
     Query(q): Query<ListQuery>,
 ) -> Res<Json<Value>> {
     let own_only = user.role == Role::Faculty;
-    let rows: Vec<CredRow> = sqlx::query_as(&format!(
-        "SELECT {CRED_COLS} FROM credentials WHERE ($1::uuid IS NULL OR created_by = $1) AND ($2::text IS NULL OR status = $2)
-         ORDER BY created_at DESC LIMIT 200"
+    let limit = page::limit(q.limit, 50, 200);
+    let (before_at, before_id) = match q.before.as_deref() {
+        Some(c) => {
+            let (at, id) = page::decode(c)?;
+            (Some(at), Some(id))
+        }
+        None => (None, None),
+    };
+    let mut rows: Vec<CredRow> = sqlx::query_as(&format!(
+        "SELECT {CRED_COLS} FROM credentials
+         WHERE ($1::uuid IS NULL OR created_by = $1)
+           AND ($2::text IS NULL OR status = $2)
+           AND ($3::text IS NULL OR student_id = $3)
+           AND ($4::timestamptz IS NULL OR (created_at, id) < ($4, $5))
+         ORDER BY created_at DESC, id DESC LIMIT $6"
     ))
     .bind(own_only.then_some(user.id))
     .bind(q.status)
-    .fetch_all(&st.db).await?;
+    .bind(
+        q.student_id
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    )
+    .bind(before_at)
+    .bind(before_id)
+    .bind(limit + 1)
+    .fetch_all(&st.db)
+    .await?;
+    let next = (rows.len() as i64 > limit).then(|| {
+        rows.truncate(limit as usize);
+        let last = rows.last().expect("a full page is not empty");
+        page::encode(last.created_at, last.id)
+    });
     Ok(Json(json!({ "credentials": rows.iter().map(|c| json!({
         "id": c.id, "student_id": c.student_id, "student_name": c.student_name, "program": c.program,
         "status": c.status, "created_at": c.created_at,
-    })).collect::<Vec<_>>() })))
+    })).collect::<Vec<_>>(), "next": next })))
 }
 
 async fn load(st: &AppState, user: &AuthUser, id: Uuid) -> Res<CredRow> {

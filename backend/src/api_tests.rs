@@ -44,6 +44,7 @@ fn state(pool: PgPool) -> AppState {
         cfg: Arc::new(Config::for_tests()),
         limiter: Arc::new(RateLimiter::default()),
         ts_lock: Arc::new(tokio::sync::Mutex::new(())),
+        chain_cache: Arc::default(),
     }
 }
 
@@ -1310,5 +1311,380 @@ async fn the_metrics_endpoint_is_not_part_of_the_public_router(pool: PgPool) {
     assert_eq!(
         raw_get(&api, "/api/v1/metrics", None).await.status(),
         StatusCode::NOT_FOUND
+    );
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Paging and the whole-chain check
+// ---------------------------------------------------------------------------------------------------------
+
+fn ids(v: &Value, key: &str) -> Vec<String> {
+    v[key]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[sqlx::test]
+async fn credentials_are_listed_a_page_at_a_time_without_gaps_or_repeats(pool: PgPool) {
+    let api = start(pool).await;
+    let t = api.everyone().await;
+    let mut made = vec![];
+    for n in 0..7 {
+        let mut c = card();
+        c["student_id"] = json!(if n % 2 == 0 { "EVEN" } else { "ODD" });
+        let r = api.post("/credentials", Some(&t[0]), c).await;
+        made.push(r.body["id"].as_str().unwrap().to_string());
+    }
+
+    let mut seen = vec![];
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let path = match &cursor {
+            Some(c) => format!("/credentials?limit=3&before={c}"),
+            None => "/credentials?limit=3".into(),
+        };
+        let r = api.get(&path, Some(&t[1])).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+        seen.extend(ids(&r.body, "credentials"));
+        pages += 1;
+        match r.body["next"].as_str() {
+            Some(n) => cursor = Some(n.to_string()),
+            None => break,
+        }
+    }
+    assert_eq!(pages, 3, "7 items in pages of 3");
+    let mut newest_first = made.clone();
+    newest_first.reverse();
+    assert_eq!(seen, newest_first, "every credential once, newest first");
+
+    // A page that ends exactly at the end has no cursor (no empty extra page).
+    let all = api.get("/credentials?limit=7", Some(&t[1])).await;
+    assert_eq!(all.body["next"], Value::Null);
+    // Sizes are clamped, not trusted.
+    assert_eq!(
+        ids(
+            &api.get("/credentials?limit=0", Some(&t[1])).await.body,
+            "credentials"
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        ids(
+            &api.get("/credentials?limit=99999", Some(&t[1])).await.body,
+            "credentials"
+        )
+        .len(),
+        7
+    );
+    // Filters work with paging.
+    let even = api
+        .get("/credentials?student_id=EVEN&limit=2", Some(&t[1]))
+        .await
+        .body;
+    assert_eq!(ids(&even, "credentials").len(), 2);
+    assert!(even["next"].is_string());
+    assert_eq!(
+        ids(
+            &api.get("/credentials?student_id=NOBODY", Some(&t[1]))
+                .await
+                .body,
+            "credentials"
+        )
+        .len(),
+        0
+    );
+    // Junk cursors are refused rather than ignored.
+    for junk in ["junk", "1.2", "1.00000000-0000-0000-0000-000000000000x"] {
+        assert_eq!(
+            api.get(&format!("/credentials?before={junk}"), Some(&t[1]))
+                .await
+                .status,
+            StatusCode::BAD_REQUEST,
+            "{junk}"
+        );
+    }
+}
+
+#[sqlx::test]
+async fn paging_does_not_let_faculty_see_each_others_credentials(pool: PgPool) {
+    let api = start(pool).await;
+    let t = api.everyone().await;
+    sqlx::query("INSERT INTO users (id, email, password_hash, role) VALUES ($1,'other@t.test',$2,'faculty')")
+        .bind(Uuid::new_v4())
+        .bind(password_hash())
+        .execute(&api.st.db)
+        .await
+        .unwrap();
+    let other = api.login("other").await;
+    for _ in 0..3 {
+        api.create(&t[0]).await;
+        api.create(&other).await;
+    }
+    let first = api.get("/credentials?limit=2", Some(&t[0])).await.body;
+    let second = api
+        .get(
+            &format!(
+                "/credentials?limit=2&before={}",
+                first["next"].as_str().unwrap()
+            ),
+            Some(&t[0]),
+        )
+        .await
+        .body;
+    assert_eq!(
+        ids(&first, "credentials").len() + ids(&second, "credentials").len(),
+        3,
+        "only their own three"
+    );
+    assert_eq!(second["next"], Value::Null);
+}
+
+#[sqlx::test]
+async fn the_audit_log_pages_and_filters(pool: PgPool) {
+    let api = start(pool).await;
+    let t = api.everyone().await;
+    for _ in 0..4 {
+        api.create(&t[0]).await;
+    }
+    let p1 = api.get("/audit?limit=3", Some(&t[3])).await.body;
+    assert_eq!(p1["logs"].as_array().unwrap().len(), 3);
+    let cursor = p1["next"].as_i64().unwrap();
+    let p2 = api
+        .get(&format!("/audit?limit=3&before={cursor}"), Some(&t[3]))
+        .await
+        .body;
+    let last_of_first = p1["logs"][2]["id"].as_i64().unwrap();
+    assert!(p2["logs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|l| l["id"].as_i64().unwrap() < last_of_first));
+    let created = api
+        .get("/audit?action=CREDENTIAL_CREATED&limit=500", Some(&t[3]))
+        .await
+        .body;
+    assert_eq!(created["logs"].as_array().unwrap().len(), 4);
+    assert!(created["logs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|l| l["action"] == "CREDENTIAL_CREATED"));
+    assert_eq!(created["next"], Value::Null);
+}
+
+#[sqlx::test]
+async fn blocks_are_listed_newest_first_a_page_at_a_time(pool: PgPool) {
+    let api = start(pool).await;
+    let t = api.everyone().await;
+    for _ in 0..5 {
+        api.issue(&t).await;
+        assert_eq!(
+            api.post("/ledger/seal", Some(&t[3]), json!({}))
+                .await
+                .status,
+            StatusCode::OK
+        );
+    }
+    let p1 = api.get("/ledger/blocks?limit=2", Some(&t[3])).await.body;
+    let heights = |v: &Value| {
+        v["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["height"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(heights(&p1), vec![5, 4]);
+    let p2 = api
+        .get(
+            &format!("/ledger/blocks?limit=2&before={}", p1["next"]),
+            Some(&t[3]),
+        )
+        .await
+        .body;
+    assert_eq!(heights(&p2), vec![3, 2]);
+    let p3 = api
+        .get(
+            &format!("/ledger/blocks?limit=2&before={}", p2["next"]),
+            Some(&t[3]),
+        )
+        .await
+        .body;
+    assert_eq!(heights(&p3), vec![1]);
+    assert_eq!(p3["next"], Value::Null);
+}
+
+/// Writes `n` sealed blocks of one credential each straight into the database, signed by the real university key.
+async fn forge_chain(api: &Api, n: i64) {
+    let (key_id, seed) = keys::active_signer(&api.st, "university").await.unwrap();
+    let (faculty,): (Uuid,) = sqlx::query_as("SELECT id FROM users WHERE role = 'faculty'")
+        .fetch_one(&api.st.db)
+        .await
+        .unwrap();
+    let mut prev = "0".repeat(64);
+    for h in 1..=n {
+        let leaf = crate::crypto::sha256_hex(format!("leaf {h}").as_bytes());
+        let root = crate::crypto::merkle::root(std::slice::from_ref(&leaf)).unwrap();
+        let hash = crate::ledger::block_hash(h, &prev, &root, 1_700_000_000 + h, 1);
+        sqlx::query("INSERT INTO blocks (height, prev_hash, merkle_root, leaves, ts, block_hash, signature, key_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
+            .bind(h).bind(&prev).bind(&root).bind(json!([leaf])).bind(1_700_000_000 + h).bind(&hash)
+            .bind(crate::crypto::sign(&seed, hash.as_bytes())).bind(key_id)
+            .execute(&api.st.db).await.unwrap();
+        sqlx::query("INSERT INTO credentials (id, student_id, student_name, program, graduation_date, credential_hash, status, created_by, block_height, leaf_index) VALUES ($1,'S','N','P','2025-01-01',$2,'issued',$3,$4,0)")
+            .bind(Uuid::new_v4()).bind(&leaf).bind(faculty).bind(h)
+            .execute(&api.st.db).await.unwrap();
+        prev = hash;
+    }
+}
+
+#[sqlx::test]
+async fn a_long_chain_is_checked_in_full_and_reported_a_window_at_a_time(pool: PgPool) {
+    let api = start(pool).await;
+    forge_chain(&api, 1200).await;
+
+    let started = std::time::Instant::now();
+    let v = api.get("/ledger/verify", None).await.body;
+    let took = started.elapsed();
+    assert_eq!(
+        (
+            v["ok"].clone(),
+            v["length"].clone(),
+            v["failed_total"].clone()
+        ),
+        (json!(true), json!(1200), json!(0))
+    );
+    assert_eq!(
+        v["blocks"].as_array().unwrap().len(),
+        100,
+        "a window, not the whole chain"
+    );
+    assert_eq!(v["next_from"], 101);
+    assert!(took.as_secs() < 5, "1200 blocks took {took:?}");
+
+    // Walk the windows: every block exactly once, all fine.
+    let (mut from, mut count) = (1, 0);
+    loop {
+        let w = api
+            .get(&format!("/ledger/verify?from={from}&limit=500"), None)
+            .await
+            .body;
+        let blocks = w["blocks"].as_array().unwrap();
+        assert!(blocks.iter().all(|b| b["ok"] == true));
+        assert_eq!(blocks[0]["height"], from);
+        count += blocks.len();
+        match w["next_from"].as_i64() {
+            Some(n) => from = n,
+            None => break,
+        }
+    }
+    assert_eq!(count, 1200);
+
+    // Damage far inside the chain is found, named, and does not hide behind the window.
+    tamper(
+        &api.st.db,
+        "UPDATE blocks SET merkle_root = repeat('f', 64) WHERE height = 777",
+        None,
+    )
+    .await;
+    let v = api.get("/ledger/verify", None).await.body;
+    assert_eq!(
+        (v["ok"].clone(), v["failed_blocks"].clone()),
+        (json!(false), json!([777]))
+    );
+    let w = api.get("/ledger/verify?from=770&limit=10", None).await.body;
+    let bad: Vec<i64> = w["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|b| b["ok"] == false)
+        .map(|b| b["height"].as_i64().unwrap())
+        .collect();
+    assert_eq!(bad, vec![777]);
+}
+
+#[sqlx::test]
+async fn a_missing_block_in_the_middle_is_detected_even_across_pages(pool: PgPool) {
+    let api = start(pool).await;
+    forge_chain(&api, 6).await;
+    // Removing a block (and its credential link) leaves a gap: the next block no longer follows its neighbour.
+    tamper(
+        &api.st.db,
+        "UPDATE credentials SET block_height = NULL, leaf_index = NULL WHERE block_height = 3",
+        None,
+    )
+    .await;
+    tamper(&api.st.db, "DELETE FROM blocks WHERE height = 3", None).await;
+    let v = api.get("/ledger/verify", None).await.body;
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["failed_blocks"], json!([4]));
+}
+
+#[sqlx::test]
+async fn the_chain_check_is_cached_briefly_and_reset_by_a_new_block(pool: PgPool) {
+    let st0 = state(pool.clone());
+    let mut cfg = Config::for_tests();
+    cfg.chain_cache_secs = 3600;
+    let st = AppState {
+        cfg: Arc::new(cfg),
+        ..st0
+    };
+    keys::ensure_initial_keys(&st).await.unwrap();
+    for (name, role) in ROLES {
+        sqlx::query("INSERT INTO users (id, email, password_hash, role) VALUES ($1,$2,$3,$4)")
+            .bind(Uuid::new_v4())
+            .bind(format!("{name}@t.test"))
+            .bind(password_hash())
+            .bind(role)
+            .execute(&st.db)
+            .await
+            .unwrap();
+    }
+    let api = Api {
+        app: router(st.clone()),
+        st,
+    };
+    let t = api.everyone().await;
+    api.issue(&t).await;
+    api.post("/ledger/seal", Some(&t[3]), json!({})).await;
+
+    let first = api.get("/ledger/verify", None).await.body;
+    assert_eq!(
+        (first["ok"].clone(), first["cached"].clone()),
+        (json!(true), json!(false))
+    );
+    tamper(
+        &api.st.db,
+        "UPDATE blocks SET merkle_root = repeat('0', 64) WHERE height = 1",
+        None,
+    )
+    .await;
+    let second = api.get("/ledger/verify", None).await.body;
+    assert_eq!(
+        (second["ok"].clone(), second["cached"].clone()),
+        (json!(true), json!(true)),
+        "served from memory"
+    );
+    assert_eq!(second["checked_at"], first["checked_at"]);
+    assert_eq!(
+        second["blocks"][0]["ok"], false,
+        "but the per-block window is always live"
+    );
+
+    // Sealing another block drops the cached answer, so the damage shows at once.
+    api.issue(&t).await;
+    api.post("/ledger/seal", Some(&t[3]), json!({})).await;
+    let third = api.get("/ledger/verify", None).await.body;
+    assert_eq!(
+        (
+            third["ok"].clone(),
+            third["cached"].clone(),
+            third["length"].clone()
+        ),
+        (json!(false), json!(false), json!(2))
     );
 }

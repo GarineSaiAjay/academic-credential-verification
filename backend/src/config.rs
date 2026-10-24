@@ -56,6 +56,8 @@ pub struct Config {
     pub require_mfa_roles: Vec<Role>,
     /// Where the Prometheus endpoint listens (METRICS_BIND). Unset: no metrics endpoint.
     pub metrics_bind: Option<String>,
+    /// How long the public whole-chain check may be served from memory (CHAIN_VERIFY_CACHE_SECS; 0 = never).
+    pub chain_cache_secs: u64,
 }
 
 /// An address range such as `172.29.250.0/24`; a bare address is a range of one.
@@ -289,6 +291,7 @@ impl Config {
                 .is_some_and(|v| v == "true"),
             require_mfa_roles,
             metrics_bind: metrics_bind()?,
+            chain_cache_secs: bounded("CHAIN_VERIFY_CACHE_SECS", 30, 0, 3600)?,
         })
     }
 }
@@ -322,6 +325,7 @@ impl Config {
             require_admin_enrollment: false,
             require_mfa_roles: vec![],
             metrics_bind: None,
+            chain_cache_secs: 0,
         }
     }
 }

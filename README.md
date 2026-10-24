@@ -261,7 +261,7 @@ the audit log and the ledger return to that moment. Test a restore on a spare ma
 user's two-factor, the signing keys and the ledger.
 
 **Withdrawing a release.** Migrations only go forward when the server starts. If a release has to be undone, run
-`scripts/migrate-down.sh TARGET --yes` (for example `6` undoes migrations 0008 and 0007). Each undo script in
+`scripts/migrate-down.sh TARGET --yes` (for example `6` undoes migrations 0009, 0008 and 0007). Each undo script in
 `backend/migrations-down/` says what data it deletes; a backup is taken first, the backend is stopped, and you then start the
 older release. Migration 0001 cannot be undone (that would be the whole database): restore a backup instead. The test applies
 and reverses every migration and checks the schema is identical afterwards.
@@ -327,6 +327,26 @@ Authenticated: `GET /auth/me`, `POST /auth/logout`, `GET|POST /credentials`, `GE
 `POST /auth/sessions/:id/revoke`, `POST /auth/sessions/revoke-others`, `GET /auth/totp`,
 `POST /auth/totp/{setup,enable,disable,recovery-codes}`.
 `university_admin` only: `GET|POST /users`, `POST /users/:id/{role,active,password,reset-link,totp/reset,sessions/revoke}`. All under `/api/v1`.
+
+### Paging and the whole-chain check
+
+List endpoints return a page and a cursor, so old records stay reachable and a long history costs the same as a short one:
+
+| Endpoint | Parameters | Result |
+|----------|------------|--------|
+| `GET /credentials` | `status`, `student_id` (exact), `limit` (default 50, max 200), `before` | `credentials`, `next` |
+| `GET /ledger/blocks` | `limit` (50, max 200), `before` (a height) | `blocks`, `next` (newest first) |
+| `GET /audit` | `action`, `limit` (100, max 500), `before` (an entry id) | `logs`, `next` |
+
+Pass the `next` of one page as `before` of the next; `next` is null on the last page. A cursor that this server did not return is refused
+with 400. `GET /users` returns at most 1000 accounts.
+
+`GET /ledger/verify` is public, so its cost is bounded: the whole chain is checked in batches of 500 blocks (a handful of queries per batch,
+not several per block), at most once per `CHAIN_VERIFY_CACHE_SECS` (default 30) however many people ask, and again right after a block is
+sealed. `ok`, `length` and `failed_blocks` (the first 100 failing heights) always describe the whole chain; `checked_at` and `cached` say
+how fresh that is. `blocks` is a window of per-block reports (`from`, `limit` up to 500, continue with `next_from`) that is always computed
+live. `GET /verify/:id` for a single credential never uses the cache. A single block holds at most 10,000 credentials; a larger backlog is
+sealed in several blocks.
 
 ## Limits you should know about
 

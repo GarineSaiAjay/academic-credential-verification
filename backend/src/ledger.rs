@@ -1,5 +1,14 @@
-use axum::{extract::State, Json};
-use serde::Serialize;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use axum::{
+    extract::{Query, State},
+    Json,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
@@ -10,8 +19,12 @@ use crate::{
     credentials::CredRow,
     crypto::{self, merkle, Step},
     error::{AppError, Res},
-    keys, timestamp, AppState,
+    keys, page, timestamp, AppState,
 };
+
+/// A block holds at most this many credentials, so one seal can never build an unbounded block. The rest wait
+/// for the next seal.
+const MAX_PER_BLOCK: i64 = 10_000;
 
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -27,7 +40,7 @@ struct Block {
     key_id: Uuid,
 }
 
-fn block_hash(height: i64, prev: &str, root: &str, ts: i64, n: usize) -> String {
+pub fn block_hash(height: i64, prev: &str, root: &str, ts: i64, n: usize) -> String {
     crypto::sha256_hex(format!("ACVS-BLOCK-v1|{height}|{prev}|{root}|{ts}|{n}").as_bytes())
 }
 
@@ -107,8 +120,8 @@ pub async fn seal(State(st): State<AppState>, user: AuthUser) -> Res<Json<Value>
         .execute(&mut *tx)
         .await?;
     let pending: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, credential_hash FROM credentials WHERE status = 'issued' AND block_height IS NULL ORDER BY created_at, id FOR UPDATE",
-    ).fetch_all(&mut *tx).await?;
+        "SELECT id, credential_hash FROM credentials WHERE status = 'issued' AND block_height IS NULL ORDER BY created_at, id LIMIT $1 FOR UPDATE",
+    ).bind(MAX_PER_BLOCK).fetch_all(&mut *tx).await?;
     if pending.is_empty() {
         return Err(AppError::Conflict(
             "no issued credentials are waiting to be anchored".into(),
@@ -138,6 +151,8 @@ pub async fn seal(State(st): State<AppState>, user: AuthUser) -> Res<Json<Value>
             .await?;
     }
     tx.commit().await?;
+    // The chain just grew: the next public check must look at it.
+    *st.chain_cache.lock().await = None;
 
     if st.cfg.tsa.is_some() {
         let st = st.clone();
@@ -160,60 +175,227 @@ pub async fn seal(State(st): State<AppState>, user: AuthUser) -> Res<Json<Value>
     ))
 }
 
-pub async fn blocks(State(st): State<AppState>, _user: AuthUser) -> Res<Json<Value>> {
-    let rows: Vec<Block> = sqlx::query_as("SELECT * FROM blocks ORDER BY height DESC LIMIT 100")
-        .fetch_all(&st.db)
-        .await?;
+#[derive(Deserialize)]
+pub struct BlocksQuery {
+    limit: Option<i64>,
+    /// Blocks below this height only: the `next` value of the previous page.
+    before: Option<i64>,
+}
+
+/// One page of blocks, newest first.
+pub async fn blocks(
+    State(st): State<AppState>,
+    _user: AuthUser,
+    Query(q): Query<BlocksQuery>,
+) -> Res<Json<Value>> {
+    let limit = page::limit(q.limit, 50, 200);
+    let mut rows: Vec<Block> = sqlx::query_as(
+        "SELECT * FROM blocks WHERE ($1::bigint IS NULL OR height < $1) ORDER BY height DESC LIMIT $2",
+    )
+    .bind(q.before)
+    .bind(limit + 1)
+    .fetch_all(&st.db)
+    .await?;
+    let next = (rows.len() as i64 > limit).then(|| {
+        rows.truncate(limit as usize);
+        rows.last().map_or(0, |b| b.height)
+    });
     let pending: (i64,) = sqlx::query_as(
         "SELECT count(*) FROM credentials WHERE status = 'issued' AND block_height IS NULL",
     )
     .fetch_one(&st.db)
     .await?;
-    let mut blocks = vec![];
-    for b in &rows {
-        blocks.push(json!({
-            "height": b.height, "prev_hash": b.prev_hash, "merkle_root": b.merkle_root, "block_hash": b.block_hash,
-            "timestamp": b.ts, "credentials": b.leaves().len(),
-            "external_timestamp": timestamp::summary(&st.db, b.height, &b.block_hash).await?,
-        }));
-    }
+    let heights: Vec<i64> = rows.iter().map(|b| b.height).collect();
+    let stamps: HashMap<i64, (chrono::DateTime<chrono::Utc>, String, String)> =
+        sqlx::query_as::<_, (i64, chrono::DateTime<chrono::Utc>, String, String)>(
+            "SELECT block_height, gen_time, tsa_url, imprint FROM block_timestamps WHERE block_height = ANY($1)",
+        )
+        .bind(&heights)
+        .fetch_all(&st.db)
+        .await?
+        .into_iter()
+        .map(|(h, t, u, i)| (h, (t, u, i)))
+        .collect();
+    let blocks: Vec<Value> = rows
+        .iter()
+        .map(|b| {
+            json!({
+                "height": b.height, "prev_hash": b.prev_hash, "merkle_root": b.merkle_root, "block_hash": b.block_hash,
+                "timestamp": b.ts, "credentials": b.leaves().len(),
+                "external_timestamp": stamps.get(&b.height).map(|(time, tsa, imprint)| json!({ "time": time, "tsa": tsa, "imprint_ok": *imprint == b.block_hash })),
+            })
+        })
+        .collect();
     Ok(Json(json!({
         "pending_unanchored": pending.0,
         "timestamping": st.cfg.tsa.as_ref().map(|t| json!({ "url": t.url })),
         "blocks": blocks,
+        "next": next,
     })))
 }
 
-/// Public: re-verifies the entire chain (linkage, hashes, Merkle roots, signatures, leaf integrity).
-pub async fn verify_chain(State(st): State<AppState>) -> Res<Json<Value>> {
-    let rows: Vec<Block> = sqlx::query_as("SELECT * FROM blocks ORDER BY height")
-        .fetch_all(&st.db)
-        .await?;
-    let mut prev = GENESIS.to_string();
-    let mut report = vec![];
-    let mut all_ok = true;
-    for (i, b) in rows.iter().enumerate() {
-        let (block_ok, key_status) = b.check(&st.db).await?;
-        let linked = b.prev_hash == prev && b.height == i as i64 + 1;
-        let leaves = b.leaves();
-        let stored: Vec<(String,)> = sqlx::query_as(
-            "SELECT credential_hash FROM credentials WHERE block_height = $1 ORDER BY leaf_index",
-        )
-        .bind(b.height)
-        .fetch_all(&st.db)
-        .await?;
-        let leaves_ok = stored
-            .iter()
-            .map(|(h,)| h.as_str())
-            .eq(leaves.iter().map(String::as_str));
-        // A stored timestamp must be about this very block; a block without one is merely not stamped yet.
-        let stamp = timestamp::chain_status(&st.db, b.height, &b.block_hash).await?;
-        let ok = block_ok && linked && leaves_ok && stamp != "mismatch";
-        all_ok &= ok;
-        report.push(json!({ "height": b.height, "ok": ok, "linked": linked, "block_ok": block_ok, "leaves_match_credentials": leaves_ok, "key_status": key_status, "external_timestamp": stamp }));
-        prev = b.block_hash.clone();
+/// Result of checking the whole chain. Only failures are kept, so it stays small however long the chain is.
+pub struct ChainSummary {
+    length: i64,
+    failed_total: i64,
+    /// Heights of the first failing blocks (at most 100).
+    failed: Vec<i64>,
+    checked_at: i64,
+}
+
+/// Blocks checked per round trip to the database when walking the whole chain.
+const CHECK_PAGE: i64 = 500;
+
+/// Checks up to `limit` consecutive blocks starting at height `from`: linkage, hash, Merkle root, signature,
+/// that the credentials stored for the block are exactly its leaves, and the outside timestamp. Uses a fixed
+/// number of queries however many blocks that is. Returns each block's report and the height to continue from.
+async fn check_range(db: &PgPool, from: i64, limit: i64) -> Res<(Vec<(bool, Value)>, Option<i64>)> {
+    let mut rows: Vec<Block> =
+        sqlx::query_as("SELECT * FROM blocks WHERE height >= $1 ORDER BY height LIMIT $2")
+            .bind(from)
+            .bind(limit + 1)
+            .fetch_all(db)
+            .await?;
+    let next = (rows.len() as i64 > limit).then(|| {
+        rows.truncate(limit as usize);
+        rows.last().map_or(0, |b| b.height + 1)
+    });
+    if rows.is_empty() {
+        return Ok((vec![], None));
     }
-    Ok(Json(
-        json!({ "ok": all_ok, "length": rows.len(), "blocks": report }),
-    ))
+    // What the first block of the page must link back to.
+    let mut prev: Option<String> = if from <= 1 {
+        Some(GENESIS.to_string())
+    } else {
+        sqlx::query_scalar("SELECT block_hash FROM blocks WHERE height = $1")
+            .bind(from - 1)
+            .fetch_optional(db)
+            .await?
+    };
+    let heights: Vec<i64> = rows.iter().map(|b| b.height).collect();
+    let key_ids: Vec<Uuid> = rows.iter().map(|b| b.key_id).collect();
+    let keys: HashMap<Uuid, (String, String)> = sqlx::query_as::<_, (Uuid, String, String)>(
+        "SELECT id, public_key, status FROM signing_keys WHERE id = ANY($1)",
+    )
+    .bind(&key_ids)
+    .fetch_all(db)
+    .await?
+    .into_iter()
+    .map(|(id, k, s)| (id, (k, s)))
+    .collect();
+    let mut stored: HashMap<i64, Vec<String>> = HashMap::new();
+    for (h, hash) in sqlx::query_as::<_, (i64, String)>(
+        "SELECT block_height, credential_hash FROM credentials WHERE block_height = ANY($1) ORDER BY block_height, leaf_index",
+    )
+    .bind(&heights)
+    .fetch_all(db)
+    .await?
+    {
+        stored.entry(h).or_default().push(hash);
+    }
+    let stamps: HashMap<i64, String> = sqlx::query_as::<_, (i64, String)>(
+        "SELECT block_height, imprint FROM block_timestamps WHERE block_height = ANY($1)",
+    )
+    .bind(&heights)
+    .fetch_all(db)
+    .await?
+    .into_iter()
+    .collect();
+
+    let mut reports = Vec::with_capacity(rows.len());
+    let mut expected_height = from;
+    for b in &rows {
+        let leaves = b.leaves();
+        let (public, key_status) = keys.get(&b.key_id).cloned().unwrap_or_default();
+        let block_ok = merkle::root(&leaves).as_deref() == Some(b.merkle_root.as_str())
+            && block_hash(b.height, &b.prev_hash, &b.merkle_root, b.ts, leaves.len())
+                == b.block_hash
+            && crypto::verify(&public, &b.signature, b.block_hash.as_bytes())
+            && key_status != "revoked";
+        let linked = prev.as_deref() == Some(b.prev_hash.as_str()) && b.height == expected_height;
+        let leaves_ok = stored.get(&b.height).map_or(&[][..], Vec::as_slice) == leaves.as_slice();
+        // A stored timestamp must be about this very block; a block without one is merely not stamped yet.
+        let stamp = match stamps.get(&b.height) {
+            None => "none",
+            Some(i) if *i == b.block_hash => "ok",
+            Some(_) => "mismatch",
+        };
+        let ok = block_ok && linked && leaves_ok && stamp != "mismatch";
+        reports.push((ok, json!({ "height": b.height, "ok": ok, "linked": linked, "block_ok": block_ok, "leaves_match_credentials": leaves_ok, "key_status": key_status, "external_timestamp": stamp })));
+        prev = Some(b.block_hash.clone());
+        expected_height = b.height + 1;
+    }
+    Ok((reports, next))
+}
+
+async fn check_all(db: &PgPool) -> Res<ChainSummary> {
+    let (mut from, mut length, mut failed_total, mut failed) = (1, 0, 0, vec![]);
+    loop {
+        let (reports, next) = check_range(db, from, CHECK_PAGE).await?;
+        for (ok, report) in &reports {
+            length += 1;
+            if !ok {
+                failed_total += 1;
+                if failed.len() < 100 {
+                    failed.push(report["height"].as_i64().unwrap_or_default());
+                }
+            }
+        }
+        match next {
+            Some(n) => from = n,
+            None => break,
+        }
+    }
+    Ok(ChainSummary {
+        length,
+        failed_total,
+        failed,
+        checked_at: chrono::Utc::now().timestamp(),
+    })
+}
+
+/// The whole-chain result, recomputed at most once per `CHAIN_VERIFY_CACHE_SECS` however many people ask, and
+/// whenever a block is sealed. Concurrent callers wait for one computation instead of each doing their own.
+async fn chain_summary(st: &AppState) -> Res<(Arc<ChainSummary>, bool)> {
+    let ttl = Duration::from_secs(st.cfg.chain_cache_secs);
+    let mut cache = st.chain_cache.lock().await;
+    if let Some((at, summary)) = cache.as_ref() {
+        if at.elapsed() < ttl {
+            return Ok((summary.clone(), true));
+        }
+    }
+    let summary = Arc::new(check_all(&st.db).await?);
+    *cache = Some((Instant::now(), summary.clone()));
+    Ok((summary, false))
+}
+
+#[derive(Deserialize)]
+pub struct VerifyQuery {
+    /// First block of the per-block report (default 1).
+    from: Option<i64>,
+    /// Blocks in the per-block report (default 100, at most 500).
+    limit: Option<i64>,
+}
+
+/// Public: re-verifies the whole chain (linkage, hashes, Merkle roots, signatures, leaf integrity, outside
+/// timestamps). `ok`, `length` and `failed_blocks` always describe the whole chain; `blocks` is a window of
+/// per-block reports, and `next_from` is where to continue.
+pub async fn verify_chain(
+    State(st): State<AppState>,
+    Query(q): Query<VerifyQuery>,
+) -> Res<Json<Value>> {
+    let (summary, cached) = chain_summary(&st).await?;
+    let from = q.from.unwrap_or(1).max(1);
+    let (reports, next_from) = check_range(&st.db, from, page::limit(q.limit, 100, 500)).await?;
+    Ok(Json(json!({
+        "ok": summary.failed_total == 0,
+        "length": summary.length,
+        "failed_total": summary.failed_total,
+        "failed_blocks": summary.failed,
+        "checked_at": summary.checked_at,
+        "cached": cached,
+        "from": from,
+        "next_from": next_from,
+        "blocks": reports.into_iter().map(|(_, r)| r).collect::<Vec<_>>(),
+    })))
 }
