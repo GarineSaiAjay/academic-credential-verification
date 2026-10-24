@@ -54,6 +54,8 @@ pub struct Config {
     pub require_admin_enrollment: bool,
     /// Roles that must sign in with a second factor; without one set up they can do nothing but set it up.
     pub require_mfa_roles: Vec<Role>,
+    /// Where the Prometheus endpoint listens (METRICS_BIND). Unset: no metrics endpoint.
+    pub metrics_bind: Option<String>,
 }
 
 /// An address range such as `172.29.250.0/24`; a bare address is a range of one.
@@ -136,6 +138,16 @@ fn trusted_proxies() -> Result<Vec<Cidr>, String> {
             .collect()
     })
     .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn metrics_bind() -> Result<Option<String>, String> {
+    match optional("METRICS_BIND") {
+        None => Ok(None),
+        Some(v) => v
+            .parse::<std::net::SocketAddr>()
+            .map(|_| Some(v.clone()))
+            .map_err(|_| format!("METRICS_BIND '{v}' must look like 0.0.0.0:9090")),
+    }
 }
 
 fn optional(name: &str) -> Option<String> {
@@ -276,6 +288,7 @@ impl Config {
             require_admin_enrollment: optional("REQUIRE_ADMIN_ENROLLMENT")
                 .is_some_and(|v| v == "true"),
             require_mfa_roles,
+            metrics_bind: metrics_bind()?,
         })
     }
 }
@@ -308,6 +321,7 @@ impl Config {
             require_personal: false,
             require_admin_enrollment: false,
             require_mfa_roles: vec![],
+            metrics_bind: None,
         }
     }
 }

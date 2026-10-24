@@ -9,6 +9,7 @@ mod error;
 mod keybackup;
 mod keys;
 mod ledger;
+mod metrics;
 mod reset;
 mod security;
 mod sessions;
@@ -80,7 +81,8 @@ async fn seed_demo_users(st: &AppState) -> Result<(), error::AppError> {
 
 pub fn router(st: AppState) -> Router {
     let public = Router::new()
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(metrics::health))
+        .route("/ready", get(metrics::ready))
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/reset-password", post(reset::redeem))
         .route("/api/v1/auth/login/mfa", post(totp::login))
@@ -201,7 +203,36 @@ pub fn router(st: AppState) -> Router {
             HeaderValue::from_static("no-store"),
         ))
         .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|req: &axum::http::Request<_>| {
+                    // The route template, never the real path or query: ids and hashes stay out of the logs.
+                    let route = req
+                        .extensions()
+                        .get::<axum::extract::MatchedPath>()
+                        .map_or("unmatched", axum::extract::MatchedPath::as_str);
+                    let id = req
+                        .headers()
+                        .get("x-request-id")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("-");
+                    // Health checks run every few seconds; they are only logged when debugging.
+                    if matches!(route, "/health" | "/ready") {
+                        tracing::debug_span!("http", request_id = %id, method = %req.method(), route = %route)
+                    } else {
+                        tracing::info_span!("http", request_id = %id, method = %req.method(), route = %route)
+                    }
+                })
+                .on_response(
+                    |resp: &axum::http::Response<_>, took: Duration, span: &tracing::Span| {
+                        if !span.is_disabled() {
+                            tracing::info!(parent: span, status = resp.status().as_u16(), took_ms = took.as_millis() as u64, "request finished");
+                        }
+                    },
+                ),
+        )
+        .layer(middleware::from_fn(metrics::track))
+        .layer(middleware::from_fn(metrics::request_id))
         .with_state(st)
 }
 
@@ -217,11 +248,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logs = tracing_subscriber::fmt().with_env_filter(
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
     );
-    // Commands print their result on stdout, so logs must not share it.
-    if cli {
-        logs.with_writer(std::io::stderr).init();
-    } else {
-        logs.init();
+    // LOG_FORMAT=json writes one JSON object per line, for log shippers. Commands print their result on
+    // stdout, so their logs must not share it.
+    let json = std::env::var("LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("json"));
+    match (json, cli) {
+        (true, true) => logs.json().with_writer(std::io::stderr).init(),
+        (true, false) => logs.json().init(),
+        (false, true) => logs.with_writer(std::io::stderr).init(),
+        (false, false) => logs.init(),
     }
 
     let cfg = Config::from_env()?;
@@ -287,6 +321,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         timestamp::preflight(tsa).await?;
         tracing::info!(url = %tsa.url, "anchoring sealed blocks to an external timestamp authority");
         tokio::spawn(timestamp::run_forever(st.clone()));
+    }
+
+    if let Some(addr) = st.cfg.metrics_bind.clone() {
+        let app = Router::new()
+            .route("/metrics", get(metrics::render))
+            .with_state(st.clone());
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        tracing::info!(%addr, "serving metrics");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                tracing::error!(error = %e, "metrics listener stopped");
+            }
+        });
     }
 
     let listener = tokio::net::TcpListener::bind(&st.cfg.bind).await?;

@@ -23,6 +23,7 @@ pub async fn log(
     rid: Option<&str>,
     details: Value,
 ) {
+    crate::metrics::audit_event(action);
     let r = sqlx::query(
         "INSERT INTO audit_logs (action, actor_id, actor_email, resource_type, resource_id, details) VALUES ($1,$2,$3,$4,$5,$6)",
     )

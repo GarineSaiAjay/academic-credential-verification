@@ -86,6 +86,15 @@ async fn shared_hit(
 /// instances and across restarts (the counter lives in Postgres); degrades to a per-process count if the
 /// database is slow or down.
 pub async fn hit(st: &AppState, key: &str, limit: u32, window_secs: u64) -> Hit {
+    let h = count_hit(st, key, limit, window_secs).await;
+    if !h.allowed {
+        // The part before the first colon names the kind of limit (login, user, ip, ...), never a person.
+        crate::metrics::rate_limited(key.split(':').next().unwrap_or("other"));
+    }
+    h
+}
+
+async fn count_hit(st: &AppState, key: &str, limit: u32, window_secs: u64) -> Hit {
     if !st.limiter.check(
         &format!("pre:{key}"),
         limit.saturating_mul(LOCAL_FACTOR),

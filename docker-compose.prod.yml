@@ -40,6 +40,9 @@ services:
       REQUIRE_ADMIN_ENROLLMENT: ${REQUIRE_ADMIN_ENROLLMENT:-}
       WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-}
       REQUIRE_MFA_ROLES: ${REQUIRE_MFA_ROLES:-}
+      # Prometheus endpoint, reachable only on the compose network (the port is not published).
+      METRICS_BIND: ${METRICS_BIND-0.0.0.0:9090}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
       RATE_LIMIT_IP_PER_MIN: ${RATE_LIMIT_IP_PER_MIN:-}
       RATE_LIMIT_USER_PER_MIN: ${RATE_LIMIT_USER_PER_MIN:-}
       LOGIN_IP_PER_MIN: ${LOGIN_IP_PER_MIN:-}
@@ -59,7 +62,7 @@ services:
     volumes:
       - ./deploy/tsa:/etc/acvs/tsa:ro
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/ready"]
       interval: 5s
       timeout: 3s
       retries: 10

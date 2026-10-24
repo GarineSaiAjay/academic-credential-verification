@@ -1166,3 +1166,149 @@ async fn every_state_change_leaves_an_audit_record(pool: PgPool) {
     .unwrap();
     assert_eq!(leaked.0, 0, "no password in the log");
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Health, request ids and metrics
+// ---------------------------------------------------------------------------------------------------------
+
+async fn scrape(api: &Api) -> String {
+    let app = Router::new()
+        .route("/metrics", axum::routing::get(crate::metrics::render))
+        .with_state(api.st.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    String::from_utf8(to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap()
+}
+
+async fn raw_get(api: &Api, path: &str, request_id: Option<&str>) -> axum::response::Response {
+    let mut req = Request::builder().uri(path);
+    if let Some(id) = request_id {
+        req = req.header("x-request-id", id);
+    }
+    let mut req = req.body(Body::empty()).unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo("203.0.113.9:1".parse::<SocketAddr>().unwrap()));
+    api.app.clone().oneshot(req).await.unwrap()
+}
+
+#[sqlx::test]
+async fn liveness_ignores_the_database_but_readiness_needs_it(pool: PgPool) {
+    let api = start(pool).await;
+    assert_eq!(
+        raw_get(&api, "/health", None).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(raw_get(&api, "/ready", None).await.status(), StatusCode::OK);
+
+    api.st.db.close().await;
+    assert_eq!(
+        raw_get(&api, "/health", None).await.status(),
+        StatusCode::OK,
+        "still alive"
+    );
+    let r = raw_get(&api, "/ready", None).await;
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE, "but not ready");
+}
+
+#[sqlx::test]
+async fn every_response_has_a_request_id_and_odd_ones_are_replaced(pool: PgPool) {
+    let api = start(pool).await;
+    let id =
+        |r: &axum::response::Response| r.headers()["x-request-id"].to_str().unwrap().to_string();
+
+    let r = raw_get(&api, "/health", Some("trace-1234.abcd")).await;
+    assert_eq!(
+        id(&r),
+        "trace-1234.abcd",
+        "a plain id from the proxy is kept"
+    );
+    let generated = id(&raw_get(&api, "/health", None).await);
+    assert!(Uuid::parse_str(&generated).is_ok());
+    for odd in [
+        "short",
+        "has spaces in it!",
+        &"x".repeat(200),
+        "semi;colon<>quote\"",
+    ] {
+        let got = id(&raw_get(&api, "/health", Some(odd)).await);
+        assert_ne!(got, odd, "{odd:?} must not be echoed");
+        assert!(Uuid::parse_str(&got).is_ok());
+    }
+    assert!(raw_get(&api, "/no/such/page", None)
+        .await
+        .headers()
+        .contains_key("x-request-id"));
+}
+
+#[sqlx::test]
+async fn metrics_count_what_happened_without_leaking_identifiers(pool: PgPool) {
+    let api = start(pool).await;
+    let t = api.everyone().await;
+    let id = api.issue(&t).await;
+    api.get(&format!("/verify/{id}"), None).await;
+    api.get("/no/such/page", None).await;
+    // trip the per-account lock-out so a rate-limit counter moves
+    for _ in 0..6 {
+        api.post(
+            "/auth/login",
+            None,
+            json!({ "email": "auditor@t.test", "password": "wrong wrong wrong" }),
+        )
+        .await;
+    }
+
+    let text = scrape(&api).await;
+    let has = |needle: &str| assert!(text.contains(needle), "missing {needle}\n{text}");
+    has(r#"acvs_http_requests_total{method="GET",route="/api/v1/verify/:id",status="200"}"#);
+    has(
+        r#"acvs_http_requests_total{method="POST",route="/api/v1/credentials/:id/approve",status="200"}"#,
+    );
+    has(r#"route="unmatched""#);
+    has("acvs_http_request_duration_seconds_bucket");
+    has(r#"acvs_audit_events_total{action="CREDENTIAL_CREATED"}"#);
+    has(r#"acvs_audit_events_total{action="LOGIN_FAILED"}"#);
+    has("acvs_db_up 1");
+    has(r#"acvs_credentials{status="issued"} 1"#);
+    has("acvs_credentials_waiting_for_seal 1");
+    has("acvs_ledger_height 0");
+    has("acvs_active_sessions 5");
+    has("acvs_build_info{version=");
+    assert!(
+        !text.contains(&id),
+        "a credential id must never become a label"
+    );
+    assert!(!text.contains("t.test"), "no e-mail address in the metrics");
+    assert!(
+        !text.contains("203.0.113.9"),
+        "no client address in the metrics"
+    );
+
+    api.post("/ledger/seal", Some(&t[3]), json!({})).await;
+    let text = scrape(&api).await;
+    assert!(
+        text.contains("acvs_ledger_height 1")
+            && text.contains("acvs_credentials_waiting_for_seal 0")
+    );
+    assert!(text.contains("acvs_blocks_without_external_timestamp 1"));
+}
+
+#[sqlx::test]
+async fn the_metrics_endpoint_is_not_part_of_the_public_router(pool: PgPool) {
+    let api = start(pool).await;
+    assert_eq!(
+        raw_get(&api, "/metrics", None).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        raw_get(&api, "/api/v1/metrics", None).await.status(),
+        StatusCode::NOT_FOUND
+    );
+}

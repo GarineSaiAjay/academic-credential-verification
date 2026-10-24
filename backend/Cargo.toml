@@ -20,7 +20,8 @@ argon2 = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+prometheus = { version = "0.14", default-features = false }
 thiserror = "1"
 aes-gcm = "0.10"
 rand = "0.8"

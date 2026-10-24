@@ -266,6 +266,44 @@ user's two-factor, the signing keys and the ledger.
 older release. Migration 0001 cannot be undone (that would be the whole database): restore a backup instead. The test applies
 and reverses every migration and checks the schema is identical afterwards.
 
+## Health checks, logs and metrics
+
+| Endpoint | Where | Meaning |
+|----------|-------|---------|
+| `/health` | backend port 8000 (not published) | the process is alive; never touches the database |
+| `/ready` | backend port 8000 (not published) | the database answers `SELECT 1` within 2 seconds, otherwise `503`. Compose uses it as the health check, and a load balancer should too |
+| `/metrics` | `METRICS_BIND` (default `0.0.0.0:9090` inside the compose network, **not published**) | Prometheus text format; empty `METRICS_BIND` turns it off |
+
+The metrics port is a separate listener so the public web server and the reverse proxy can never reach it. Point Prometheus at
+`backend:9090` from inside the network; do not publish the port. Exported: request counts and a latency histogram per route
+template (`/api/v1/credentials/:id`, never the real id), audit events by action (`LOGIN_FAILED`, `CREDENTIAL_SIGNED`, `BLOCK_SEALED`, ...),
+rate-limit refusals by kind of limit, credentials by status, ledger height, seconds since the last block, issued credentials still
+waiting to be sealed, blocks without an outside timestamp, active sessions, database pool use and whether the database answered the scrape.
+No label holds an e-mail address, a client address or an identifier. Suggested alerts:
+
+```yaml
+- alert: AcvsDatabaseDown          # the backend cannot reach Postgres
+  expr: acvs_db_up == 0
+  for: 2m
+- alert: AcvsLoginFailuresSpike    # someone is guessing passwords
+  expr: sum(rate(acvs_audit_events_total{action=~"LOGIN_FAILED|LOGIN_MFA_FAILED"}[5m])) > 1
+  for: 10m
+- alert: AcvsNotSealing            # approved credentials are not being anchored in the ledger
+  expr: acvs_credentials_waiting_for_seal > 0 and acvs_ledger_last_block_age_seconds > 86400
+- alert: AcvsNoOutsideTimestamp    # only if you configured a timestamp authority
+  expr: acvs_blocks_without_external_timestamp > 3
+  for: 1h
+- alert: AcvsServerErrors
+  expr: sum(rate(acvs_http_requests_total{status=~"5.."}[5m])) > 0.1
+  for: 10m
+```
+
+Logs go to standard output. `LOG_FORMAT=json` writes one JSON object per line for a log shipper (default is plain text). Every
+request gets an `X-Request-Id` (a plain id sent by the proxy is kept, anything else is replaced), which appears in the response and
+on that request's log lines, so a user's failing request can be found. Logs name the route template, never the path, query string,
+password or token. Health checks are logged only at debug level. `RUST_LOG` sets the level.
+`scripts/observability-test.sh` checks all of this on a running stack, including what happens when the database stops.
+
 ## Security controls
 
 | Control | Implementation |
