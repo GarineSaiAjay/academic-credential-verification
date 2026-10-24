@@ -7,8 +7,9 @@ COPY src src
 COPY migrations migrations
 RUN touch src/main.rs && cargo build --release --locked
 
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates curl openssl \
+FROM alpine:3.23
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates curl openssl \
     && addgroup -S -g 10001 acvs \
     && adduser -S -u 10001 -G acvs -H -h /app -s /sbin/nologin acvs
 WORKDIR /app

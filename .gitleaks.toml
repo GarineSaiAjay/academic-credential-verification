@@ -1,0 +1,7 @@
+# Secret scanning (gitleaks). The default rules apply; only deliberate test fixtures are allowed.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Throw-away passwords used as fixtures by the end-to-end scripts"
+paths = ['''scripts/auth-test\.sh''', '''scripts/recovery-test\.sh''']

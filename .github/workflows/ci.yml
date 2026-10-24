@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "17 5 * * 1"
 
 jobs:
   backend:
@@ -38,6 +40,45 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run build
+
+  # Known-vulnerability, secret and image checks. They also run weekly, because a new advisory can appear
+  # without any change to the code.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 } # secret scanning reads the whole history
+      - name: Rust dependencies (RustSec advisories)
+        working-directory: backend # picks up .cargo/audit.toml, which lists the advisories we accept and why
+        run: cargo install cargo-audit --locked --version ^0.22 && cargo audit --deny warnings
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: npm dependencies
+        working-directory: frontend
+        run: npm ci && npm audit --audit-level=high
+      - name: Secrets in the repository and its history
+        run: docker run --rm -v "$PWD":/repo zricethezav/gitleaks:v8.30.0 detect --source /repo --config /repo/.gitleaks.toml --no-banner --redact
+
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t acvs-backend backend && docker build -t acvs-frontend frontend
+      # Our own images must have no fixable high or critical vulnerability and no embedded secret.
+      - name: Scan the images this project builds
+        run: |
+          for img in acvs-backend acvs-frontend; do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.69.3 image \
+              --severity HIGH,CRITICAL --ignore-unfixed --scanners vuln,secret --exit-code 1 "$img"
+          done
+      # Third-party images are not ours to patch, so they are reported without failing the build.
+      # Dependabot opens a pull request when a newer tag exists.
+      - name: Report on the images from other projects
+        run: |
+          for img in $(grep -h 'image:' docker-compose*.yml | awk '{print $2}' | sort -u); do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.69.3 image \
+              --severity HIGH,CRITICAL --ignore-unfixed --scanners vuln "$img" || true
+          done
 
   e2e:
     runs-on: ubuntu-latest

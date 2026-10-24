@@ -207,7 +207,7 @@ pub fn router(st: AppState) -> Router {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| !keybackup::is_command(a)) {
         eprintln!("{}", keybackup::USAGE);

@@ -276,6 +276,16 @@ The API tests need `DATABASE_URL` to point at a Postgres server you may create d
 
 The scripts in `scripts/` (`smoke.sh`, `auth-test.sh`, `prod-test.sh`, `rotation-test.sh`, ...) and `e2e/` test whole running stacks, including TLS, the WAF, Docker and a real browser. CI runs all of them.
 
+## Dependency, secret and image scanning
+
+`scripts/audit.sh` runs the checks CI runs on every push and pull request and again every Monday (new advisories appear without any code change):
+
+- **Rust crates:** `cargo audit --deny warnings` against the RustSec database. Advisories that were reviewed and accepted are listed with their reasons in `backend/.cargo/audit.toml`.
+- **npm packages:** `npm audit --audit-level=high` (the production dependencies, which are only React, have none).
+- **Secrets:** gitleaks over the files and the whole git history, with the throw-away passwords in two test scripts allowed in `.gitleaks.toml`.
+- **Images:** Trivy on the backend and front-end images; any fixable high or critical vulnerability, or a secret inside an image, fails the build. The images other projects publish (Postgres, the WAF, Caddy) are scanned and reported but do not fail it, because we cannot patch them.
+- **Updates:** `.github/dependabot.yml` opens weekly pull requests for Cargo, npm, both Dockerfiles, the images named in the compose files and the GitHub Actions.
+
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
