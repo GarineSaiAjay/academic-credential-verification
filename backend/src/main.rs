@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod api_tests;
 mod audit;
 mod auth;
 mod config;

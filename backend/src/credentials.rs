@@ -1153,6 +1153,91 @@ pub async fn qr(State(st): State<AppState>, Path(id): Path<Uuid>) -> Res<impl In
 mod tests {
     use super::*;
 
+    #[test]
+    fn each_stage_can_only_be_signed_by_its_role_in_order() {
+        use Role::*;
+        let all = [Faculty, ExamCell, Registrar, UniversityAdmin, Auditor];
+        let table = [
+            (
+                "pending_exam_cell",
+                ExamCell,
+                "exam_cell",
+                "pending_registrar",
+            ),
+            (
+                "pending_registrar",
+                Registrar,
+                "registrar",
+                "pending_university",
+            ),
+            (
+                "pending_university",
+                UniversityAdmin,
+                "university",
+                "issued",
+            ),
+        ];
+        for (status, role, stage, next) in table {
+            for r in all {
+                let got = next_stage(status, r);
+                if r == role {
+                    assert_eq!(got, Some((stage, next)), "{status} by {r:?}");
+                } else {
+                    assert_eq!(got, None, "{status} by {r:?}");
+                }
+            }
+        }
+        for status in ["issued", "revoked", "rejected", "nonsense"] {
+            assert!(
+                all.iter().all(|r| next_stage(status, *r).is_none()),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_finished_unhappy_credentials_can_be_replaced() {
+        for v in ["REVOKED", "REJECTED", "INVALID"] {
+            assert!(can_reissue(v), "{v}");
+        }
+        for v in ["VALID", "PENDING", ""] {
+            assert!(!can_reissue(v), "{v}");
+        }
+    }
+
+    #[test]
+    fn a_status_needs_exactly_as_many_approvals() {
+        let approval = |role: &str| ApprovalRow {
+            role: role.into(),
+            signature: String::new(),
+            signed_at: Utc::now(),
+            key_id: Uuid::nil(),
+            public_key: String::new(),
+            key_status: "active".into(),
+            cs_key_id: None,
+            cs_rp_id: None,
+            cs_origin: None,
+            cs_auth: None,
+            cs_client: None,
+            cs_sig: None,
+            uk_public_key: None,
+            uk_status: None,
+        };
+        let mut c = cred("pending_registrar");
+        c.credential_hash = c.recompute_hash();
+        let rows = [approval("faculty"), approval("exam_cell")];
+        assert!(evaluate(&c, &rows).status_ok);
+        assert!(evaluate(&c, &rows).order_ok);
+        assert!(
+            !evaluate(&c, &rows[..1]).status_ok,
+            "one approval is too few"
+        );
+        let swapped = [approval("exam_cell"), approval("faculty")];
+        assert!(!evaluate(&c, &swapped).order_ok, "stages out of order");
+        c.status = "issued".into();
+        assert!(!evaluate(&c, &rows).status_ok, "issued needs all four");
+    }
+
     fn cred(status: &str) -> CredRow {
         CredRow {
             id: Uuid::nil(),

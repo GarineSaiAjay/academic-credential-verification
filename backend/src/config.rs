@@ -279,3 +279,35 @@ impl Config {
         })
     }
 }
+
+#[cfg(test)]
+impl Config {
+    /// A configuration for tests that talk to the router in-process: generous limits, no proxies, no extras.
+    pub fn for_tests() -> Self {
+        Self {
+            database_url: String::new(),
+            jwt_secret: "test-secret-test-secret-test-secret!".into(),
+            enc_key: KeyRing::new([7; 32], vec![]),
+            bind: "127.0.0.1:0".into(),
+            public_base_url: "http://localhost:3000".into(),
+            trusted_proxies: vec![],
+            seed_password: None,
+            bootstrap_admin: None,
+            tsa: None,
+            webauthn: WebAuthnConfig {
+                rp_id: "localhost".into(),
+                origin: "http://localhost:3000".into(),
+            },
+            rate: RateConfig {
+                ip_per_min: 100_000,
+                user_per_min: 100_000,
+                login_ip_per_min: 100_000,
+                login_account_failures: 5,
+                login_account_window_secs: 900,
+            },
+            require_personal: false,
+            require_admin_enrollment: false,
+            require_mfa_roles: vec![],
+        }
+    }
+}

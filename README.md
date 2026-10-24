@@ -260,6 +260,22 @@ Authenticated: `GET /auth/me`, `POST /auth/logout`, `GET|POST /credentials`, `GE
 - Stage keys belong to a stage, not a person; for personal accountability use personal signatures (above), which are optional unless `REQUIRE_PERSONAL_SIGNATURES=true`.
 - Password reset is administrator-assisted (no e-mail), and two-factor sign-in is opt-in unless `REQUIRE_MFA_ROLES` is set. Authenticator codes can be phished like passwords; the optional personal security keys (above) are the phishing-resistant option for approvals.
 
+## Tests
+
+`scripts/test.sh` runs the fast tests in about a minute (it starts a throwaway Postgres in Docker for the API tests):
+
+| Layer | What | Where |
+|-------|------|-------|
+| Rust unit tests | cryptography, Merkle proofs, stage order, verdict rules, password and TOTP rules, address handling | `backend/src/*.rs` (`mod tests`) |
+| Rust API tests | the real router against a real database, one fresh database per test: the four-stage lifecycle, who may do what, rejection, revocation and re-issue, tampering detected, append-only triggers, the ledger, key rotation, sign-in, lock-out, password change and reset links, replayed requests, audit records | `backend/src/api_tests.rs` |
+| Front-end tests | Vitest + Testing Library: request signing headers, session handling, navigation per role, the two-step sign-in, password reset, the public verification page | `frontend/src/*.test.ts(x)` |
+
+The API tests need `DATABASE_URL` to point at a Postgres server you may create databases on, for example
+`docker run -d -p 55432:5432 -e POSTGRES_PASSWORD=test postgres:16-alpine` and
+`DATABASE_URL=postgres://postgres:test@localhost:55432/postgres cargo test` in `backend/`.
+
+The scripts in `scripts/` (`smoke.sh`, `auth-test.sh`, `prod-test.sh`, `rotation-test.sh`, ...) and `e2e/` test whole running stacks, including TLS, the WAF, Docker and a real browser. CI runs all of them.
+
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).

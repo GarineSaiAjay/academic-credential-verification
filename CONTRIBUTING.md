@@ -37,13 +37,16 @@ Branch from `main` using `<type>/<short-description>`:
 These are the same checks CI runs; please make them pass before opening a PR.
 
 ```bash
-# backend (from backend/)
+# everything fast in one go (starts a throwaway Postgres in Docker for the API tests)
+./scripts/test.sh
+
+# or by hand: backend (from backend/; the API tests need DATABASE_URL, see the README "Tests" section)
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 
 # frontend (from frontend/)
-npm ci && npm run build
+npm ci && npm test && npm run build
 
 # full stack (from the repo root)
 docker compose up -d --build --wait
