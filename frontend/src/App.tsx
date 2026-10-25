@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { getSession } from './api';
-import { Account, Audit, CredDetail, CredList, Keys, Ledger, Login, NewCredential, ResetPassword, Users, Verify, go, logout } from './pages';
+import { Account, Audit, CredDetail, CredList, Keys, Ledger, Login, ImportCredentials, NewCredential, ResetPassword, Users, Verify, go, logout } from './pages';
 
 function useHash() {
   const read = () => window.location.hash.replace(/^#/, '') || '/';
@@ -33,6 +33,7 @@ export default function App() {
   else if (session.mfaSetup) page = <Account setupRequired />;
   else if (parts[0] === 'login') page = <Login />;
   else if (parts[0] === 'new') page = <NewCredential />;
+  else if (parts[0] === 'import' && session.role === 'faculty') page = <ImportCredentials />;
   else if (parts[0] === 'c' && parts[1]) page = <CredDetail id={parts[1]} role={session.role} />;
   else if (parts[0] === 'keys') page = <Keys role={session.role} />;
   else if (parts[0] === 'ledger') page = <Ledger role={session.role} />;

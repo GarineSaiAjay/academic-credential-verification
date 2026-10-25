@@ -3,16 +3,23 @@
 {$DOMAIN} {
 	encode zstd gzip
 
-	# The API accepts at most 16 KB; refuse anything larger before it reaches the WAF.
-	request_body {
-		max_size 32KB
-	}
-
 	header {
 		Strict-Transport-Security "max-age=31536000"
 		-Server
 	}
 
 	# Caddy replaces any client-supplied X-Forwarded-For with the real peer address.
-	reverse_proxy waf:8080
+	# The API accepts at most 16 KB (1 MB for a bulk import); refuse anything larger before it reaches the WAF.
+	handle /api/v1/credentials/bulk {
+		request_body {
+			max_size 1MB
+		}
+		reverse_proxy waf:8080
+	}
+	handle {
+		request_body {
+			max_size 32KB
+		}
+		reverse_proxy waf:8080
+	}
 }

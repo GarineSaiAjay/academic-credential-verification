@@ -457,6 +457,63 @@ pub async fn create(
     ))
 }
 
+/// The most credentials one import may carry.
+pub const BULK_MAX: usize = 500;
+
+#[derive(Deserialize)]
+pub struct BulkBody {
+    /// Not called "credentials": the WAF reads a JSON key like that as a request for a file of secrets.
+    items: Vec<CreateBody>,
+}
+
+/// Creates up to `BULK_MAX` credentials, each signed as faculty, in one transaction: either every row is
+/// accepted or none is, and a rejected row is named by its position (1 = the first).
+pub async fn create_bulk(
+    State(st): State<AppState>,
+    user: AuthUser,
+    Json(b): Json<BulkBody>,
+) -> Res<(StatusCode, Json<Value>)> {
+    user.require(&[Role::Faculty])?;
+    if b.items.is_empty() {
+        return Err(AppError::BadRequest("no credentials to import".into()));
+    }
+    if b.items.len() > BULK_MAX {
+        return Err(AppError::BadRequest(format!(
+            "at most {BULK_MAX} credentials per import"
+        )));
+    }
+    let mut parsed = Vec::with_capacity(b.items.len());
+    for (i, row) in b.items.into_iter().enumerate() {
+        parsed.push(parse_fields(row).map_err(|e| match e {
+            AppError::BadRequest(m) => AppError::BadRequest(format!("row {}: {m}", i + 1)),
+            other => other,
+        })?);
+    }
+    let mut tx = st.db.begin().await?;
+    let mut made = Vec::with_capacity(parsed.len());
+    for f in &parsed {
+        made.push(insert_credential(&st, &mut tx, &user, f, None).await?);
+    }
+    tx.commit().await?;
+
+    for (id, hash) in &made {
+        audit::actor_log(
+            &st.db,
+            &user,
+            "CREDENTIAL_CREATED",
+            "credential",
+            &id.to_string(),
+            json!({ "hash": hash, "bulk": true }),
+        )
+        .await;
+    }
+    let ids: Vec<Uuid> = made.iter().map(|(id, _)| *id).collect();
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "created": ids.len(), "ids": ids, "status": "pending_exam_cell" })),
+    ))
+}
+
 #[derive(Deserialize)]
 pub struct ListQuery {
     status: Option<String>,

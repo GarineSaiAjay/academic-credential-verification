@@ -101,6 +101,8 @@ services:
       SET_REAL_IP_FROM: 172.29.250.10
       REAL_IP_HEADER: X-Forwarded-For
       SERVER_HEADER: ""
+      # A bulk import of 500 credentials is 3,000 JSON values; the default allows 1,000.
+      MODSEC_ARGUMENTS_LIMIT: "3200"
     healthcheck:
       test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:8080/healthz"]
       interval: 5s

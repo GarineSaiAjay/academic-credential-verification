@@ -2,7 +2,7 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getSession } from './api';
-import { Audit, CredList, Ledger, Login, ResetPassword, Verify } from './pages';
+import { Audit, CredList, ImportCredentials, Ledger, Login, ResetPassword, Verify } from './pages';
 
 type Reply = { status?: number; body: unknown };
 /** Answers fetch calls in order; returns the mock so tests can inspect what was sent. */
@@ -254,5 +254,44 @@ describe('lists that arrive a page at a time', () => {
     await waitFor(() => expect(f.mock.calls[1][0]).toBe('/api/v1/ledger/blocks?limit=50&before=3'));
     await userEvent.click(screen.getByRole('button', { name: 'Verify whole chain' }));
     expect(await screen.findByText('CHAIN BROKEN (blocks 2)')).toBeInTheDocument();
+  });
+});
+
+describe('ImportCredentials', () => {
+  const file = (text: string) => new File([text], 'c.csv', { type: 'text/csv' });
+  const HEAD = 'student_id,student_name,program,graduation_date,gpa,honors';
+
+  it('previews a CSV file, then sends every row in one request', async () => {
+    const f = serve({ status: 201, body: { created: 2 } });
+    render(<ImportCredentials />);
+    await userEvent.upload(screen.getByLabelText('CSV file'), file(`${HEAD}\nS1,Ada,BSc,2025-05-15,3.9,First\nS2,Alan,MSc,2025-06-01,,\n`));
+    await screen.findByText('2 credential(s) ready. Check the first rows, then import.');
+    expect(f).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: 'Import 2 and sign as faculty' }));
+    await screen.findByText(/Imported\./);
+    expect(f.mock.calls[0][0]).toBe('/api/v1/credentials/bulk');
+    expect(body(f, 0).items).toEqual([
+      { student_id: 'S1', student_name: 'Ada', program: 'BSc', graduation_date: '2025-05-15', gpa: '3.9', honors: 'First' },
+      { student_id: 'S2', student_name: 'Alan', program: 'MSc', graduation_date: '2025-06-01', gpa: '', honors: '' },
+    ]);
+    expect(screen.queryByRole('button', { name: /^Import 2/ })).toBeNull();
+  });
+
+  it('explains a bad file and offers no import button', async () => {
+    const f = serve();
+    render(<ImportCredentials />);
+    await userEvent.upload(screen.getByLabelText('CSV file'), file('student_id,program\nS1,BSc'));
+    await screen.findByText(/header row is missing: student_name, graduation_date/);
+    expect(screen.queryByRole('button', { name: /^Import/ })).toBeNull();
+    expect(f).not.toHaveBeenCalled();
+  });
+
+  it('shows the row the server rejected and keeps the file for another try', async () => {
+    serve({ status: 400, body: { error: 'row 2: graduation_date must be YYYY-MM-DD' } });
+    render(<ImportCredentials />);
+    await userEvent.upload(screen.getByLabelText('CSV file'), file(`${HEAD}\nS1,Ada,BSc,2025-05-15,,\nS2,Alan,MSc,15/06/2025,,\n`));
+    await userEvent.click(await screen.findByRole('button', { name: 'Import 2 and sign as faculty' }));
+    await screen.findByText('row 2: graduation_date must be YYYY-MM-DD');
+    expect(screen.getByRole('button', { name: 'Import 2 and sign as faculty' })).toBeTruthy();
   });
 });

@@ -160,6 +160,10 @@ pub fn router(st: AppState) -> Router {
         .route("/api/v1/users/:id/password", post(users::reset_password))
         .route("/api/v1/credentials", post(credentials::create))
         .route(
+            "/api/v1/credentials/bulk",
+            post(credentials::create_bulk).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
             "/api/v1/credentials/:id/approve",
             post(credentials::approve),
         )

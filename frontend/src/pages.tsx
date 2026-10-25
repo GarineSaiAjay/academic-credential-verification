@@ -1,6 +1,7 @@
 import { FormEvent, ReactNode, useCallback, useEffect, useState } from 'react';
 import { api, ApiError, getSession, Role, setSession } from './api';
 import { Challenge, registerKey, sign as signWithKey, webauthnSupported } from './webauthn';
+import { COLUMNS, CsvRow, MAX_ROWS, readCredentials } from './csv';
 
 export const go = (hash: string) => { window.location.hash = hash; };
 
@@ -211,6 +212,57 @@ export function NewCredential() {
         <label>Honors (optional)<input value={f.honors} onChange={set('honors')} maxLength={100} /></label>
         <button>Create and sign as faculty</button>
       </form>
+      <p className="muted">Many at once? <a href="#/import">Import a CSV file</a>.</p>
+    </Card>
+  );
+}
+
+const readFile = (f: File) => new Promise<string>((ok, no) => {
+  const r = new FileReader();
+  r.onload = () => ok(String(r.result));
+  r.onerror = () => no(r.error);
+  r.readAsText(f);
+});
+
+const SAMPLE_CSV = 'student_id,student_name,program,graduation_date,gpa,honors\nS-1001,Ada Lovelace,BSc Mathematics,2025-05-15,3.9,First class\n';
+
+export function ImportCredentials() {
+  const [rows, setRows] = useState<CsvRow[] | null>(null);
+  const [problem, setProblem] = useState('');
+  const { run, banner } = useAction();
+  const read = (text: string) => {
+    try { setRows(readCredentials(text)); setProblem(''); }
+    catch (e) { setRows(null); setProblem((e as Error).message); }
+  };
+  const submit = () => run(async () => {
+    const r = await api<{ created: number }>('POST', '/credentials/bulk', { items: rows });
+    setRows(null);
+    return r;
+  }, 'Imported. Every credential is signed as faculty and waits for the exam cell.');
+  return (
+    <Card title="Import credentials">
+      {banner}
+      <p className="muted">
+        A CSV file with a header row and these columns: <span className="mono">{COLUMNS.join(', ')}</span> (gpa and honors are optional,
+        dates are YYYY-MM-DD, at most {MAX_ROWS} rows). The whole file is accepted or none of it; a rejected row is named.
+      </p>
+      <p><a href={`data:text/csv;charset=utf-8,${encodeURIComponent(SAMPLE_CSV)}`} download="credentials-template.csv">Download a template</a></p>
+      <label>CSV file<input type="file" accept=".csv,text/csv" onChange={async (e) => { const f = e.target.files?.[0]; if (f) read(await readFile(f)); }} /></label>
+      <Err msg={problem} />
+      {rows && (
+        <>
+          <p>{rows.length} credential(s) ready. Check the first rows, then import.</p>
+          <table>
+            <thead><tr><th>Student ID</th><th>Name</th><th>Program</th><th>Graduation</th><th>GPA</th><th>Honors</th></tr></thead>
+            <tbody>
+              {rows.slice(0, 5).map((r, i) => (
+                <tr key={i}><td>{r.student_id}</td><td>{r.student_name}</td><td>{r.program}</td><td>{r.graduation_date}</td><td>{r.gpa}</td><td>{r.honors}</td></tr>
+              ))}
+            </tbody>
+          </table>
+          <button onClick={submit}>Import {rows.length} and sign as faculty</button>
+        </>
+      )}
     </Card>
   );
 }

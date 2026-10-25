@@ -254,6 +254,16 @@ expect "backend cannot gain privileges" "$(BX "grep '^NoNewPrivs' /proc/self/sta
 [[ "$(BX 'touch /app/probe')" == *"Read-only file system"* ]] && echo "  ok   application directory is read-only" || { echo "  FAIL application directory is writable"; fails=$((fails+1)); }
 BX 'touch /tmp/probe && rm /tmp/probe' >/dev/null && echo "  ok   /tmp is writable scratch space" || { echo "  FAIL /tmp not writable"; fails=$((fails+1)); }
 
+echo "== bulk import (a body well over the 16 KB limit of every other request)"
+ROWS=$(python3 -c '
+import json
+print(json.dumps({"items": [{"student_id": f"BULK-{i}", "student_name": f"Student Number {i}", "program": "BSc Mathematics", "graduation_date": "2025-05-15", "gpa": "3.9", "honors": "First class"} for i in range(500)]}))')
+[ ${#ROWS} -gt 16384 ] && echo "  ok   the import body is ${#ROWS} bytes" || { echo "  FAIL import body too small to test the limit"; fails=$((fails+1)); }
+call POST /credentials/bulk "$EXC" "$ROWS"; check "exam cell cannot import" 403
+call POST /credentials/bulk "$FAC" "$ROWS"; check "faculty imports the maximum, 500 credentials (3,000 values)" 201
+expect "all 500 were created" "$(echo "$BODY" | j "d['created']")" 500
+call POST /credentials "$FAC" "{\"student_id\":\"S\",\"student_name\":\"x\",\"program\":\"$(python3 -c 'print("p"*20000)')\",\"graduation_date\":\"2025-05-15\"}"; check "a single credential is still limited to 16 KB" 413
+
 echo "== rate limit"
 for i in $(seq 1 15); do call POST /auth/login "" '{"email":"x@y.z","password":"bad"}'; [ "$CODE" = 429 ] && break; done
 check "login throttled under repeated attempts" 429

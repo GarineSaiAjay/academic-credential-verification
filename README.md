@@ -326,7 +326,16 @@ Authenticated: `GET /auth/me`, `POST /auth/logout`, `GET|POST /credentials`, `GE
 `GET /ledger/blocks`, `POST /ledger/seal`, `GET /audit`, `POST /auth/password`, `GET /auth/sessions`,
 `POST /auth/sessions/:id/revoke`, `POST /auth/sessions/revoke-others`, `GET /auth/totp`,
 `POST /auth/totp/{setup,enable,disable,recovery-codes}`.
-`university_admin` only: `GET|POST /users`, `POST /users/:id/{role,active,password,reset-link,totp/reset,sessions/revoke}`. All under `/api/v1`.
+Faculty only: `POST /credentials/bulk` (see below). `university_admin` only: `GET|POST /users`, `POST /users/:id/{role,active,password,reset-link,totp/reset,sessions/revoke}`. All under `/api/v1`.
+
+### Importing many credentials
+
+Faculty can create up to 500 credentials at once: **New → Import a CSV file** in the web app (`#/import`), or `POST /credentials/bulk` with `{"items": [{student_id, student_name, program, graduation_date, gpa?, honors?}, ...]}`. The CSV needs a header row with those column names (any order; `gpa` and `honors` optional, dates `YYYY-MM-DD`).
+
+- **All or nothing.** Every row is checked with the same rules as a single credential, and everything is created in one transaction. If any row is rejected nothing is created and the error names it (`row 3: graduation_date must be YYYY-MM-DD`).
+- **Same signing path.** Each credential is signed as faculty and waits for the exam cell, exactly as if created one by one; each one gets its own `CREDENTIAL_CREATED` audit entry (marked `bulk`). Approvals stay one credential at a time, deliberately.
+- **No duplicate check.** Importing the same file twice creates the credentials twice, as creating one twice does today.
+- **Size limits.** The bulk route accepts up to 1 MB (every other route 16 KB); nginx and the production edge allow the same for that one path. The WAF's argument limit is raised to 3,200 so a full import (500 rows x 6 values) passes. The JSON key is `items` because the WAF rule set treats a key named `credentials` as a probe for a credentials file.
 
 ### Paging and the whole-chain check
 

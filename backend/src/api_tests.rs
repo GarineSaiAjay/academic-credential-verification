@@ -1714,3 +1714,160 @@ async fn old_nonces_are_purged_in_the_background_not_per_request(pool: PgPool) {
         .unwrap();
     assert!(fresh >= 1, "recent nonces must be kept");
 }
+
+fn bulk_rows(n: usize) -> Vec<Value> {
+    (0..n)
+        .map(|i| {
+            json!({
+                "student_id": format!("BULK-{i}"), "student_name": format!("Student Number {i}"),
+                "program": "BSc Mathematics", "graduation_date": "2025-05-15"
+            })
+        })
+        .collect()
+}
+
+#[sqlx::test]
+async fn a_bulk_import_creates_every_row_signed_and_ready_for_the_next_stage(pool: PgPool) {
+    let api = start(pool.clone()).await;
+    let t = api.everyone().await;
+    // 200 rows are well over the 16 KB limit that applies to every other request.
+    let rows = bulk_rows(200);
+    assert!(serde_json::to_vec(&rows).unwrap().len() > 16 * 1024);
+    let r = api
+        .post("/credentials/bulk", Some(&t[0]), json!({ "items": rows }))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    assert_eq!(r.body["created"], 200);
+    let ids = r.body["ids"].as_array().unwrap();
+    assert_eq!(ids.len(), 200);
+
+    let signed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM approvals a JOIN credentials c ON c.id = a.credential_id
+         WHERE a.role = 'faculty' AND c.status = 'pending_exam_cell' AND c.student_id LIKE 'BULK-%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(signed, 200);
+
+    // An imported credential continues through the ordinary stages and verifies.
+    let id = ids[17].as_str().unwrap();
+    for token in &t[1..4] {
+        let a = api
+            .post(
+                &format!("/credentials/{id}/approve"),
+                Some(token),
+                json!({}),
+            )
+            .await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    }
+    assert_eq!(api.verdict(id).await, "VALID");
+
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_logs WHERE action = 'CREDENTIAL_CREATED' AND details->>'bulk' = 'true'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audited, 200);
+}
+
+#[sqlx::test]
+async fn one_bad_row_rejects_the_whole_import_and_is_named(pool: PgPool) {
+    let api = start(pool.clone()).await;
+    let faculty = api.login("faculty").await;
+    let mut rows = bulk_rows(5);
+    rows[2]["graduation_date"] = json!("15/05/2025");
+    let r = api
+        .post(
+            "/credentials/bulk",
+            Some(&faculty),
+            json!({ "items": rows }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(
+        r.body["error"].as_str().unwrap().contains("row 3"),
+        "{}",
+        r.body
+    );
+
+    let mut rows = bulk_rows(5);
+    rows[4]["student_name"] = json!("  ");
+    let r = api
+        .post(
+            "/credentials/bulk",
+            Some(&faculty),
+            json!({ "items": rows }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(
+        r.body["error"].as_str().unwrap().contains("row 5"),
+        "{}",
+        r.body
+    );
+
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM credentials")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "nothing is created when any row is rejected");
+}
+
+#[sqlx::test]
+async fn bulk_import_is_faculty_only_and_bounded(pool: PgPool) {
+    let api = start(pool.clone()).await;
+    let t = api.everyone().await;
+    for token in &t[1..] {
+        let r = api
+            .post(
+                "/credentials/bulk",
+                Some(token),
+                json!({ "items": bulk_rows(1) }),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN);
+    }
+    let r = api
+        .post("/credentials/bulk", None, json!({ "items": bulk_rows(1) }))
+        .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    let r = api
+        .post("/credentials/bulk", Some(&t[0]), json!({ "items": [] }))
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = api
+        .post(
+            "/credentials/bulk",
+            Some(&t[0]),
+            json!({ "items": bulk_rows(crate::credentials::BULK_MAX + 1) }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    // Over 1 MB is refused before it is read.
+    let big = "x".repeat(1100 * 1024);
+    let r = api
+        .post(
+            "/credentials/bulk",
+            Some(&t[0]),
+            json!({ "items": [], "pad": big }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    // The single-credential route keeps its 16 KB limit.
+    let r = api
+        .post(
+            "/credentials",
+            Some(&t[0]),
+            json!({ "pad": "x".repeat(20 * 1024) }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM credentials")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}
