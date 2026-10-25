@@ -297,6 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chain_cache: Arc::default(),
     };
     tokio::spawn(security::cleanup_forever(st.db.clone()));
+    tokio::spawn(security::purge_nonces_forever(st.db.clone()));
     tokio::spawn(sessions::purge_forever(st.db.clone()));
     // Instances started together (replicas, a rolling restart) must not race to create the first keys and
     // users: whoever holds this lock initialises, the others wait and then find it done. The lock lives as

@@ -1688,3 +1688,29 @@ async fn the_chain_check_is_cached_briefly_and_reset_by_a_new_block(pool: PgPool
         (json!(false), json!(false), json!(2))
     );
 }
+
+#[sqlx::test]
+async fn old_nonces_are_purged_in_the_background_not_per_request(pool: PgPool) {
+    let api = start(pool.clone()).await;
+    let token = api.login("faculty").await;
+    sqlx::query("INSERT INTO nonces (nonce, used_at) VALUES ('old-nonce-0000000000', now() - interval '10 minutes')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let r = api.post("/credentials", Some(&token), card()).await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    let left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM nonces WHERE nonce = 'old-nonce-0000000000'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(left, 1, "a request must not run the cleanup itself");
+
+    assert_eq!(crate::security::purge_nonces(&pool).await.unwrap(), 1);
+    let fresh: i64 = sqlx::query_scalar("SELECT count(*) FROM nonces")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(fresh >= 1, "recent nonces must be kept");
+}

@@ -211,6 +211,26 @@ pub async fn cleanup_forever(db: PgPool) {
     }
 }
 
+/// Nonces only need to outlive the timestamp window (60 s either side), so five minutes is generous.
+pub async fn purge_nonces(db: &PgPool) -> Result<u64, sqlx::Error> {
+    Ok(
+        sqlx::query("DELETE FROM nonces WHERE used_at < now() - interval '5 minutes'")
+            .execute(db)
+            .await?
+            .rows_affected(),
+    )
+}
+
+/// Removes old nonces in the background, so a state-changing request pays for one insert only.
+pub async fn purge_nonces_forever(db: PgPool) {
+    loop {
+        if let Err(e) = purge_nonces(&db).await {
+            tracing::warn!(error = %e, "nonce cleanup failed");
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
 pub async fn global_rate_limit(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -258,9 +278,6 @@ pub async fn replay_guard(
             "X-Timestamp missing or outside the allowed window".into(),
         ));
     }
-    sqlx::query("DELETE FROM nonces WHERE used_at < now() - interval '5 minutes'")
-        .execute(&st.db)
-        .await?;
     let inserted = sqlx::query("INSERT INTO nonces (nonce) VALUES ($1) ON CONFLICT DO NOTHING")
         .bind(nonce)
         .execute(&st.db)
