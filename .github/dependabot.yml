@@ -1,4 +1,5 @@
-# Weekly pull requests for out-of-date or vulnerable dependencies.
+# Weekly pull requests for out-of-date or vulnerable dependencies. Actions are pinned to a commit SHA and
+# images to a digest (scripts/check-pins.sh enforces it); Dependabot rewrites the pin and the tag comment together.
 version: 2
 updates:
   - package-ecosystem: cargo

@@ -4,7 +4,7 @@
 # Demo users are never created here; create the first admin with BOOTSTRAP_ADMIN_EMAIL/PASSWORD (see README).
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36
     restart: unless-stopped
     environment:
       POSTGRES_USER: acvs
@@ -86,7 +86,7 @@ services:
         ipv4_address: 172.29.250.12
 
   waf:
-    image: owasp/modsecurity-crs:4.30.0-nginx-alpine-202610180210
+    image: owasp/modsecurity-crs:4.30.0-nginx-alpine-202610180210@sha256:873ce68a658d2e3b61484a8a24d215f7d15456e7ce5aec5e7114bf000d743365
     restart: unless-stopped
     depends_on:
       frontend:
@@ -111,7 +111,7 @@ services:
         ipv4_address: 172.29.250.11
 
   edge:
-    image: caddy:2.11.7-alpine
+    image: caddy:2.11.7-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f
     restart: unless-stopped
     depends_on:
       waf:
