@@ -40,3 +40,11 @@ button.small { padding: 0 8px; }
 .s-revoked, .s-rejected { color: var(--bad); }
 .qr { width: 200px; height: 200px; image-rendering: pixelated; border: 1px solid var(--line); }
 .who { margin-left: auto; }
+
+.printonly { display: none; }
+.qr { width: 160px; height: 160px; }
+@media print {
+  header, .noprint { display: none !important; }
+  .printonly { display: block; }
+  body { font-size: 12px; }
+}

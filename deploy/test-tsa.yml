@@ -1,0 +1,24 @@
+# TEST ONLY: adds a throwaway time-stamping authority and points the backend at it.
+# Used by scripts/timestamp-test.sh together with docker-compose.yml. ${TSA_DIR} is a host directory
+# shared with the authority (it writes its CA certificates and a "mode" file there).
+services:
+  tsa:
+    build: ./deploy/test-tsa
+    volumes:
+      - ${TSA_DIR:?set TSA_DIR}:/tsa
+    healthcheck:
+      test: ["CMD", "test", "-s", "/tsa/mode"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  backend:
+    depends_on:
+      tsa:
+        condition: service_healthy
+    environment:
+      TSA_URL: http://tsa:8318/tsr
+      TSA_CA_FILE: /tsa/ca.pem
+      TSA_INTERVAL_SECS: "10"
+    volumes:
+      - ${TSA_DIR}:/tsa:ro

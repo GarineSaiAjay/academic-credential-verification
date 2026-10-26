@@ -3,16 +3,28 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "17 5 * * 1"
 
 jobs:
   backend:
     runs-on: ubuntu-latest
     defaults: { run: { working-directory: backend } }
+    # The API tests create a throwaway database each, so they need a server they may create databases on.
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36
+        env: { POSTGRES_PASSWORD: test }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:test@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with: { components: "rustfmt, clippy" }
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with: { workspaces: backend }
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
@@ -22,19 +34,163 @@ jobs:
     runs-on: ubuntu-latest
     defaults: { run: { working-directory: frontend } }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: 22, cache: npm, cache-dependency-path: frontend/package-lock.json }
       - run: npm ci
+      - run: npm test
       - run: npm run build
+
+  # Known-vulnerability, secret and image checks. They also run weekly, because a new advisory can appear
+  # without any change to the code.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: { fetch-depth: 0 } # secret scanning reads the whole history
+      - name: Rust dependencies (RustSec advisories)
+        working-directory: backend # picks up .cargo/audit.toml, which lists the advisories we accept and why
+        run: cargo install cargo-audit --locked --version ^0.22 && cargo audit --deny warnings
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with: { node-version: 22 }
+      - name: npm dependencies
+        working-directory: frontend
+        run: npm ci && npm audit --audit-level=high
+      - name: Secrets in the repository and its history
+        run: docker run --rm -v "$PWD":/repo zricethezav/gitleaks:v8.30.0@sha256:691af3c7c5a48b16f187ce3446d5f194838f91238f27270ed36eef6359a574d9 detect --source /repo --config /repo/.gitleaks.toml --no-banner --redact
+
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: docker build -t acvs-backend backend && docker build -t acvs-frontend frontend
+      # Our own images must have no fixable high or critical vulnerability and no embedded secret.
+      - name: Scan the images this project builds
+        run: |
+          for img in acvs-backend acvs-frontend; do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.69.3@sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c image \
+              --severity HIGH,CRITICAL --ignore-unfixed --scanners vuln,secret --exit-code 1 "$img"
+          done
+      # Third-party images are not ours to patch, so they are reported without failing the build.
+      # Dependabot opens a pull request when a newer tag exists.
+      - name: Report on the images from other projects
+        run: |
+          for img in $(grep -h 'image:' docker-compose*.yml | awk '{print $2}' | sort -u); do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.69.3@sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c image \
+              --severity HIGH,CRITICAL --ignore-unfixed --scanners vuln "$img" || true
+          done
 
   e2e:
     runs-on: ubuntu-latest
     needs: [backend, frontend]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: ./scripts/gen-env.sh
       - run: docker compose up -d --build --wait
       - run: ./scripts/smoke.sh http://localhost:3000
+      - run: ./scripts/verify-race-test.py
+      - run: docker compose down -v
+      - run: ./scripts/recovery-test.sh
+      - if: failure()
+        run: docker compose logs
+
+  e2e-prod:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: ./scripts/gen-env.sh
+      - run: ./scripts/prod-test.sh
+      - run: MODE=prod ./scripts/personal-sig-test.sh
+
+  e2e-timestamp:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: ./scripts/gen-env.sh
+      - run: ./scripts/timestamp-test.sh
+
+  e2e-personal:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: ./scripts/gen-env.sh
+      - run: ./scripts/personal-sig-test.sh
+
+  e2e-browser:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: e2e/package-lock.json }
+      - run: ./scripts/gen-env.sh
+      - run: docker compose up -d --build --wait
+      - run: npm ci
+        working-directory: e2e
+      - run: PASS=$(grep '^SEED_DEMO_PASSWORD=' .env | cut -d= -f2) REPO=$PWD node e2e/browser.mjs
+      - if: failure()
+        run: docker compose logs
+
+  e2e-rotation:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: ./scripts/gen-env.sh
+      - run: ./scripts/rotation-test.sh
+
+  e2e-ratelimit:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: ./scripts/gen-env.sh
+      - run: ./scripts/ratelimit-test.sh
+
+  e2e-observability:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: ./scripts/gen-env.sh
+      - run: ./scripts/observability-test.sh
+
+  pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: scripts/check-pins.sh
+
+  e2e-backup:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: ./scripts/gen-env.sh
+      - run: ./scripts/backup-test.sh
+
+  e2e-auth:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: ./scripts/gen-env.sh
+      - run: ./scripts/auth-test.sh
+
+  e2e-auth-ui:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: e2e/package-lock.json }
+      - run: ./scripts/gen-env.sh
+      - run: SEED_DEMO_PASSWORD=$(grep '^SEED_DEMO_PASSWORD=' .env | cut -d= -f2) REQUIRE_MFA_ROLES=registrar LOGIN_IP_PER_MIN=1000 docker compose up -d --build --wait
+      - run: npm ci
+        working-directory: e2e
+      - run: PASS=$(grep '^SEED_DEMO_PASSWORD=' .env | cut -d= -f2) node e2e/auth-ui.mjs
       - if: failure()
         run: docker compose logs

@@ -1,0 +1,6 @@
+# TEST ONLY: adds the demo users so scripts/smoke.sh can run against the production stack.
+# Never use this file for a real deployment.
+services:
+  backend:
+    environment:
+      SEED_DEMO_PASSWORD: ${SEED_DEMO_PASSWORD:?set SEED_DEMO_PASSWORD}

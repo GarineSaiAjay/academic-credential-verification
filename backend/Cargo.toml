@@ -18,14 +18,23 @@ uuid = { version = "1", features = ["v4", "serde"] }
 jsonwebtoken = "9"
 argon2 = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
-dotenv = "0.15"
+dotenvy = "0.15"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+prometheus = { version = "0.14", default-features = false }
 thiserror = "1"
 aes-gcm = "0.10"
 rand = "0.8"
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 qrcode = { version = "0.14", default-features = false, features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [[bin]]
 name = "server"

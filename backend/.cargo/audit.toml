@@ -1,0 +1,11 @@
+# Advisories we have looked at and accept. Each needs a reason, and should be removed once it no longer applies.
+[advisories]
+ignore = [
+  # `rsa` is named in Cargo.lock only because sqlx lists its MySQL driver; this project uses Postgres, so the
+  # crate is never compiled or linked (`cargo tree -i rsa` finds nothing). No fixed release exists.
+  "RUSTSEC-2023-0071",
+  # crypto-bigint 0.5 timing variability, reached through p256 0.13. We only use p256 to *verify* passkey
+  # signatures, which handles public values; no secret scalar is ever processed. p256 0.14 (the fix) has not
+  # had a stable release yet. Revisit when it does.
+  "RUSTSEC-2026-0387",
+]

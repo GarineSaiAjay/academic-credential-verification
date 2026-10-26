@@ -37,13 +37,16 @@ Branch from `main` using `<type>/<short-description>`:
 These are the same checks CI runs; please make them pass before opening a PR.
 
 ```bash
-# backend (from backend/)
+# everything fast in one go (starts a throwaway Postgres in Docker for the API tests)
+./scripts/test.sh
+
+# or by hand: backend (from backend/; the API tests need DATABASE_URL, see the README "Tests" section)
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 
 # frontend (from frontend/)
-npm ci && npm run build
+npm ci && npm test && npm run build
 
 # full stack (from the repo root)
 docker compose up -d --build --wait
@@ -63,3 +66,7 @@ docker compose up -d --build --wait
 - Expect comments on correctness, security (this project signs credentials), tests, and clarity.
 - Address feedback with new commits; the PR is squash-merged, so history stays clean.
 - Changes touching signing, auth, or the ledger get extra scrutiny.
+
+## Pinned actions and images
+
+GitHub Actions are referenced by commit SHA and container images by digest (`image:tag@sha256:…`), so a moved tag cannot change what CI or the stack runs. Keep the tag next to the pin (`# v4`, `image:tag@sha256:…`) so Dependabot can update both. `scripts/check-pins.sh` fails CI on any unpinned reference. To pin a new image, use `docker buildx imagetools inspect IMAGE:TAG` and copy the top-level `Digest`.

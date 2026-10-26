@@ -1,0 +1,8 @@
+{
+  "name": "acvs-e2e",
+  "private": true,
+  "description": "Browser end-to-end test: real Chrome with a virtual WebAuthn authenticator",
+  "type": "module",
+  "scripts": { "test": "node browser.mjs" },
+  "dependencies": { "playwright-core": "1.50.1" }
+}
