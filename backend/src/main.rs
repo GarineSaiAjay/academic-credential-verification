@@ -17,6 +17,7 @@ mod sessions;
 mod timestamp;
 mod totp;
 mod users;
+mod vc;
 mod webauthn;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -94,6 +95,8 @@ pub fn router(st: AppState) -> Router {
         .route("/api/v1/auth/login/mfa", post(totp::login))
         .route("/api/v1/verify/:id", get(credentials::verify))
         .route("/api/v1/credentials/:id/qr", get(credentials::qr))
+        .route("/api/v1/credentials/:id/export", get(vc::export))
+        .route("/api/v1/vc/context", get(vc::context))
         .route("/api/v1/ledger/verify", get(ledger::verify_chain))
         .route(
             "/api/v1/ledger/blocks/:height/timestamp",

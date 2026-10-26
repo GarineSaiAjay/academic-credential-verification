@@ -320,13 +320,21 @@ password or token. Health checks are logged only at debug level. `RUST_LOG` sets
 
 ## API
 
-Public: `POST /auth/login`, `POST /auth/login/mfa`, `POST /auth/reset-password`, `GET /verify/:id`, `GET /credentials/:id/qr`, `GET /ledger/verify`.
+Public: `GET /credentials/:id/export`, `GET /vc/context`, `POST /auth/login`, `POST /auth/login/mfa`, `POST /auth/reset-password`, `GET /verify/:id`, `GET /credentials/:id/qr`, `GET /ledger/verify`.
 Authenticated: `GET /auth/me`, `POST /auth/logout`, `GET|POST /credentials`, `GET /credentials/:id`,
 `POST /credentials/:id/{approve,reject,revoke,reissue}`, `GET /keys`, `POST /keys/:role/rotate`, `POST /keys/:id/revoke`,
 `GET /ledger/blocks`, `POST /ledger/seal`, `GET /audit`, `POST /auth/password`, `GET /auth/sessions`,
 `POST /auth/sessions/:id/revoke`, `POST /auth/sessions/revoke-others`, `GET /auth/totp`,
 `POST /auth/totp/{setup,enable,disable,recovery-codes}`.
 Faculty only: `POST /credentials/bulk` (see below). `university_admin` only: `GET|POST /users`, `POST /users/:id/{role,active,password,reset-link,totp/reset,sessions/revoke}`. All under `/api/v1`.
+
+### Printing and exporting a credential
+
+On the public verify page, a credential that reads **VALID** shows **Print / save as PDF** (the browser's print dialog; the page has a print layout with the QR code and the address to verify at, and no menus) and **Download as verifiable credential (JSON)**.
+
+`GET /credentials/:id/export` (public, like verification) returns a [W3C Verifiable Credentials 2.0](https://www.w3.org/TR/vc-data-model-2.0/) shaped document: `@context`, `type`, `issuer` (`PUBLIC_BASE_URL`), `validFrom`, `credentialSubject` (name, program, graduation date, GPA, honors; never the student ID), `credentialStatus` (the live `/verify/:id` URL, which is where revocation shows up) and a `proof` array with one entry per stage. It answers 409 unless the credential is VALID at that moment. `GET /vc/context` serves the JSON-LD context that defines the extra terms.
+
+**What this is not.** The proofs are this system's own Ed25519 stage signatures, not W3C Data Integrity proofs, so a generic VC verifier will not validate them. Each proof carries the exact message it signed (`ACVS-APPROVAL-v1|<id>|<stage>|<hash>`), the public key (`verificationMethod`) and the signature (`proofValue`), so anyone can check it with any Ed25519 library; the content hash can be recomputed from the fields as described under "How it works". An exported file is a snapshot: a later revocation is only visible by asking `credentialStatus`. There is no server-side PDF; printing is done by the browser.
 
 ### Importing many credentials
 

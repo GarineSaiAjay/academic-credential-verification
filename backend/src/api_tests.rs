@@ -1871,3 +1871,94 @@ async fn bulk_import_is_faculty_only_and_bounded(pool: PgPool) {
         .unwrap();
     assert_eq!(n, 0);
 }
+
+#[sqlx::test]
+async fn an_issued_credential_exports_as_a_verifiable_credential_whose_proofs_check_independently(
+    pool: PgPool,
+) {
+    let api = start(pool).await;
+    let t = api.everyone().await;
+    let id = api.issue(&t).await;
+    let r = api.get(&format!("/credentials/{id}/export"), None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let d = &r.body;
+    assert_eq!(d["@context"][0], "https://www.w3.org/ns/credentials/v2");
+    assert_eq!(
+        d["type"],
+        json!(["VerifiableCredential", "AcvsAcademicCredential"])
+    );
+    assert_eq!(d["id"], format!("urn:uuid:{id}"));
+    assert_eq!(d["issuer"], "http://localhost:3000");
+    assert_eq!(d["credentialSubject"]["studentName"], "Ada Lovelace");
+    assert_eq!(d["credentialSubject"]["graduationDate"], "2025-05-15");
+    assert_eq!(
+        d["credentialStatus"]["id"],
+        format!("http://localhost:3000/api/v1/verify/{id}")
+    );
+    assert!(
+        !d.to_string().contains("STU-1"),
+        "the student's own identifier must not be exported"
+    );
+
+    // Re-check every proof with nothing but the document: the message it names, its key and its signature.
+    let hash = d["credentialHash"].as_str().unwrap();
+    let proofs = d["proof"].as_array().unwrap();
+    assert_eq!(proofs.len(), 4);
+    for (p, stage) in proofs
+        .iter()
+        .zip(["faculty", "exam_cell", "registrar", "university"])
+    {
+        assert_eq!(p["stage"], stage);
+        let msg = p["signedMessage"].as_str().unwrap();
+        assert_eq!(msg, format!("ACVS-APPROVAL-v1|{id}|{stage}|{hash}"));
+        let key = p["verificationMethod"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("urn:acvs:ed25519:")
+            .unwrap();
+        let sig = p["proofValue"].as_str().unwrap();
+        assert!(
+            crate::crypto::verify(key, sig, msg.as_bytes()),
+            "{stage} proof must verify"
+        );
+        assert!(
+            !crate::crypto::verify(key, sig, format!("{msg}x").as_bytes()),
+            "and only for that message"
+        );
+    }
+
+    // The context it names is served, and defines the custom terms.
+    let c = api.get("/vc/context", None).await;
+    assert_eq!(c.status, StatusCode::OK);
+    assert!(c.body["@context"]["studentName"].is_string());
+}
+
+#[sqlx::test]
+async fn only_a_valid_credential_can_be_exported(pool: PgPool) {
+    let api = start(pool).await;
+    let t = api.everyone().await;
+    let pending = api.create(&t[0]).await;
+    let r = api
+        .get(&format!("/credentials/{pending}/export"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    assert!(r.body["error"].as_str().unwrap().contains("PENDING"));
+
+    let id = api.issue(&t).await;
+    let rv = api
+        .post(
+            &format!("/credentials/{id}/revoke"),
+            Some(&t[3]),
+            json!({ "reason": "error in record" }),
+        )
+        .await;
+    assert_eq!(rv.status, StatusCode::OK, "{}", rv.body);
+    let r = api.get(&format!("/credentials/{id}/export"), None).await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    assert!(r.body["error"].as_str().unwrap().contains("REVOKED"));
+
+    let r = api
+        .get(&format!("/credentials/{}/export", Uuid::new_v4()), None)
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+}

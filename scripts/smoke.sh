@@ -54,6 +54,9 @@ expect "verdict" "$(echo "$BODY" | j "d['verdict']")" VALID
 expect "signature count" "$(echo "$BODY" | j "len(d['signatures'])")" 4
 expect "qr hash match" "$(echo "$BODY" | j "d['qr_hash_match']")" True
 call GET "/verify/$ID?h=deadbeefdeadbeef"; expect "forged qr hash detected" "$(echo "$BODY" | j "d['qr_hash_match']")" False
+call GET "/credentials/$ID/export"; check "issued credential exports as a verifiable credential (no auth)" 200
+expect "export names the credential and carries four proofs" "$(echo "$BODY" | j "(d['id'], len(d['proof']), 'STU-1' in str(d))")" "('urn:uuid:$ID', 4, False)"
+call GET /vc/context; check "its JSON-LD context is served" 200
 curl -s -o /tmp/acvs_qr.png -w '%{content_type}' "$BASE/credentials/$ID/qr" | grep -q image/png && echo "  ok   qr png served" || { echo "  FAIL qr"; fails=$((fails+1)); }
 
 echo "== ledger"

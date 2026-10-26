@@ -196,7 +196,7 @@ impl CredRow {
     }
 }
 
-async fn fetch_approvals<'e>(e: impl PgExecutor<'e>, id: Uuid) -> Res<Vec<ApprovalRow>> {
+pub async fn fetch_approvals<'e>(e: impl PgExecutor<'e>, id: Uuid) -> Res<Vec<ApprovalRow>> {
     Ok(sqlx::query_as(
         "SELECT a.role, a.signature, a.signed_at, a.key_id, k.public_key, k.status AS key_status,
                 cs.user_key_id AS cs_key_id, cs.rp_id AS cs_rp_id, cs.origin AS cs_origin,
@@ -1036,7 +1036,7 @@ async fn load_core(st: &AppState, id: Uuid) -> Res<(CredRow, Evaluation, Option<
     Ok((c, ev, term))
 }
 
-async fn assess(st: &AppState, id: Uuid) -> Res<(CredRow, Assessment)> {
+pub async fn assess(st: &AppState, id: Uuid) -> Res<(CredRow, Assessment)> {
     let (c, ev, term) = load_core(st, id).await?;
     let anchor = crate::ledger::anchor_for(&st.db, &c).await?;
     let mut verdict = verdict(&c, &ev, term.as_ref());

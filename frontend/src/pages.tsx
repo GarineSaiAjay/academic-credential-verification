@@ -375,6 +375,18 @@ export function Verify({ id, h }: { id?: string; h?: string }) {
               {v.credential.revoke_reason && <tr><th>Reason</th><td>{v.credential.revoke_reason}</td></tr>}
               {v.termination && <tr><th>Signed {v.termination.kind}</th><td className={v.termination.valid ? 'good' : 'bad'}>{v.termination.valid ? `signature valid (${v.termination.stage.replace('_', ' ')} key${v.termination.legacy ? ', added later for an older record' : ''})` : 'SIGNATURE INVALID'}</td></tr>}
             </tbody></table>
+            {v.verdict === 'VALID' && (
+              <div className="toolbar noprint">
+                <button onClick={() => window.print()}>Print / save as PDF</button>
+                <a className="btn" href={`/api/v1/credentials/${v.credential.id}/export`} download="credential.json">Download as verifiable credential (JSON)</a>
+              </div>
+            )}
+            {v.verdict === 'VALID' && (
+              <div className="printonly">
+                <img className="qr" src={`/api/v1/credentials/${v.credential.id}/qr`} alt="QR code that opens this verification page" />
+                <p>Verify this credential at {window.location.origin}/#/verify/{v.credential.id}. A printout proves nothing by itself: scan the code or open that address.</p>
+              </div>
+            )}
           </Card>
           <Card title="Checks">
             <table className="kv"><tbody>

@@ -145,6 +145,28 @@ describe('Verify', () => {
     expect(screen.getByText('not yet anchored')).toBeInTheDocument();
   });
 
+  it('offers printing and the verifiable-credential download only for a VALID credential', async () => {
+    serve({ body: verification() });
+    const print = vi.fn();
+    vi.stubGlobal('print', print);
+    render(<Verify id="c1" />);
+    await screen.findByText('VALID');
+    const link = screen.getByRole('link', { name: /Download as verifiable credential/ });
+    expect(link).toHaveAttribute('href', `/api/v1/credentials/${verification().credential.id}/export`);
+    expect(screen.getByAltText(/QR code/)).toHaveAttribute('src', `/api/v1/credentials/${verification().credential.id}/qr`);
+    await userEvent.click(screen.getByRole('button', { name: 'Print / save as PDF' }));
+    expect(print).toHaveBeenCalledOnce();
+  });
+
+  it('does not offer them for a revoked or pending credential', async () => {
+    serve({ body: verification({ verdict: 'REVOKED' }) });
+    render(<Verify id="c1" />);
+    await screen.findByText('REVOKED');
+    expect(screen.queryByRole('button', { name: /Print/ })).toBeNull();
+    expect(screen.queryByRole('link', { name: /verifiable credential/ })).toBeNull();
+    expect(screen.queryByAltText(/QR code/)).toBeNull();
+  });
+
   it('flags failed checks and a revoked credential with its reason', async () => {
     serve({ body: verification({ verdict: 'REVOKED', checks: { hash_ok: false, order_ok: true }, credential: { ...verification().credential, status: 'revoked', revoke_reason: 'issued in error' } }) });
     render(<Verify id="c1" />);
