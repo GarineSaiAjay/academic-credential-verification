@@ -35,7 +35,7 @@ jobs:
     defaults: { run: { working-directory: frontend } }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22, cache: npm, cache-dependency-path: frontend/package-lock.json }
       - run: npm ci
       - run: npm test
@@ -51,7 +51,7 @@ jobs:
       - name: Rust dependencies (RustSec advisories)
         working-directory: backend # picks up .cargo/audit.toml, which lists the advisories we accept and why
         run: cargo install cargo-audit --locked --version ^0.22 && cargo audit --deny warnings
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22 }
       - name: npm dependencies
         working-directory: frontend
@@ -124,7 +124,7 @@ jobs:
     needs: [backend, frontend]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22, cache: npm, cache-dependency-path: e2e/package-lock.json }
       - run: ./scripts/gen-env.sh
       - run: docker compose up -d --build --wait
@@ -185,7 +185,7 @@ jobs:
     needs: [backend, frontend]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22, cache: npm, cache-dependency-path: e2e/package-lock.json }
       - run: ./scripts/gen-env.sh
       - run: SEED_DEMO_PASSWORD=$(grep '^SEED_DEMO_PASSWORD=' .env | cut -d= -f2) REQUIRE_MFA_ROLES=registrar LOGIN_IP_PER_MIN=1000 docker compose up -d --build --wait
