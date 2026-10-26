@@ -77,6 +77,16 @@ if __name__ == "__main__":
     for src, dst in ((f"{good}/ca.pem", f"{ROOT}/ca.pem"), (f"{evil}/ca.pem", f"{ROOT}/evil-ca.pem")):
         with open(src) as a, open(dst, "w") as b:
             b.write(a.read())
-    os.chmod(ROOT, 0o755)
-    open(f"{ROOT}/mode", "w").write("ok\n")
+    # This runs as root, but the test script runs as the host user: it must be able to write "mode" and delete everything
+    # afterwards (on Linux hosts bind-mounted files keep their owner; Docker Desktop hides this).
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        for name in dirnames:
+            os.chmod(os.path.join(dirpath, name), 0o777)
+        for name in filenames:
+            os.chmod(os.path.join(dirpath, name), 0o666)
+    os.chmod(ROOT, 0o777)
+    mode = f"{ROOT}/mode"
+    open(mode, "w").close()
+    os.chmod(mode, 0o666)
+    open(mode, "w").write("ok\n")
     http.server.ThreadingHTTPServer(("0.0.0.0", 8318), Handler).serve_forever()

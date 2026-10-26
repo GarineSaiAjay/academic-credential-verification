@@ -53,8 +53,8 @@ export BACKUP_PASSPHRASE="backup-test-passphrase"
 OUT=$(scripts/backup.sh 2>&1); echo "$OUT" | tail -1 | grep -q 'acvs-.*\.dump\.enc' && ok "a backup is written" || bad "backup: $OUT"
 B=$(ls "$BACKUP_DIR"/acvs-*.dump.enc | head -1)
 [ -f "$B.sha256" ] && ok "with a checksum file" || bad "no checksum"
-expect "readable only by its owner" "$(stat -f %Lp "$B" 2>/dev/null || stat -c %a "$B")" 600
-expect "the directory too" "$(stat -f %Lp "$BACKUP_DIR" 2>/dev/null || stat -c %a "$BACKUP_DIR")" 700
+expect "readable only by its owner" "$(stat -c %a "$B" 2>/dev/null || stat -f %Lp "$B")" 600
+expect "the directory too" "$(stat -c %a "$BACKUP_DIR" 2>/dev/null || stat -f %Lp "$BACKUP_DIR")" 700
 head -c 8 "$B" | grep -q 'Salted__' && ! grep -qa 'Ada Lovelace' "$B" && ok "it is encrypted (no readable data in it)" || bad "backup is not encrypted"
 unset BACKUP_PASSPHRASE; OUT=$(scripts/backup.sh 2>&1); echo "$OUT" | grep -q 'not encrypted' && ok "without a passphrase it warns that it is plain" || bad "no warning"
 OUT=$(BACKUP_PASSPHRASE=short scripts/backup.sh 2>&1); echo "$OUT" | grep -q 'at least 12' && ok "a short passphrase is refused" || bad "short passphrase accepted"

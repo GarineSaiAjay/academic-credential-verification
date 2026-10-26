@@ -33,13 +33,16 @@ for _ in $(seq 1 30); do docker compose cp edge:/data/caddy/pki/authorities/loca
 [ -s "$T/root.crt" ] && ok "obtained the edge's local CA certificate" || { bad "no CA certificate"; exit 1; }
 
 echo "== exposure"
-published=$(docker compose ps --format '{{.Service}} {{.Publishers}}' | python3 -c '
-import sys, re
+published=$(docker compose ps --format json | python3 -c '
+import sys, json
+text = sys.stdin.read().strip()
+# Older compose prints one JSON object per line, newer prints a single array.
+rows = json.loads(text) if text.startswith("[") else [json.loads(l) for l in text.splitlines() if l.strip()]
 out = []
-for line in sys.stdin:
-    svc, _, pub = line.partition(" ")
-    for m in re.finditer(r"(\d+)/tcp -> (?:0\.0\.0\.0|\[::\]):(\d+)", pub):
-        out.append(f"{svc}:{m.group(2)}")
+for row in rows:
+    for p in row.get("Publishers") or []:
+        if p.get("PublishedPort") and p.get("Protocol", "tcp") == "tcp":
+            out.append(row["Service"] + ":" + str(p["PublishedPort"]))
 print(" ".join(sorted(set(out))))')
 expect "only the edge publishes ports (80, 443)" "$published" "edge:443 edge:80"
 for p in 55432 8000 3000 8080 2019; do
