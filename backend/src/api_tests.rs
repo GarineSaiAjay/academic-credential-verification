@@ -1564,7 +1564,8 @@ async fn a_long_chain_is_checked_in_full_and_reported_a_window_at_a_time(pool: P
         "a window, not the whole chain"
     );
     assert_eq!(v["next_from"], 101);
-    assert!(took.as_secs() < 5, "1200 blocks took {took:?}");
+    // Generous: ~0.6s locally, ~10s on a loaded CI runner in a debug build. It only has to catch the check going unbounded.
+    assert!(took.as_secs() < 30, "1200 blocks took {took:?}");
 
     // Walk the windows: every block exactly once, all fine.
     let (mut from, mut count) = (1, 0);
